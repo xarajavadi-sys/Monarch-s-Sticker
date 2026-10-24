@@ -186,7 +186,7 @@ async function makeVideo(input, dir, m, p) {
       ...(needsTrim ? ['-t', String(LIMITS.videoOutSec)] : []),
       '-c:v', 'libvpx-vp9', '-b:v', String(bps), '-maxrate', String(bps), '-crf', String(step.crf),
       '-pix_fmt', pixFmt, '-auto-alt-ref', '0',
-      '-row-mt', '1', '-deadline', 'good', '-cpu-used', '5', '-threads', '2',
+      '-row-mt', '1', '-deadline', 'realtime', '-cpu-used', '5', '-threads', '2',
       '-f', 'webm', out,
     ];
     const r = await run('ffmpeg', args);
