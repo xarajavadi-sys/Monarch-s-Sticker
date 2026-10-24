@@ -1,0 +1,11 @@
+# Blueprint رندر: سرویس رایگان تبدیل مدیا
+services:
+  - type: web
+    name: monarch-media
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: MEDIA_KEY
+        generateValue: true   # رندر یک رمز تصادفی می‌سازه؛ در تب Environment می‌بینیش
