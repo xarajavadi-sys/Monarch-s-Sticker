@@ -306,7 +306,7 @@ class TgErr extends Error {
 async function tgCall(method, body) {
   let r;
   try {
-    r = await fetch(`${TG_API}/bot${BOT_TOKEN}/${method}`, body ? { method: 'POST', body } : undefined);
+    r = await fetch(`${TG_API}/bot${BOT_TOKEN}/${method}`, { ...(body ? { method: 'POST', body } : {}), signal: AbortSignal.timeout(body ? 60_000 : 20_000) });
   } catch (e) { throw new TgErr(`network: ${e.message}`, false); }
   let j = null;
   try { j = await r.json(); } catch (_) { /* غیر JSON */ }
@@ -321,10 +321,11 @@ async function tgDownload(fileId, maxBytes) {
   const info = await tgCall(`getFile?file_id=${encodeURIComponent(fileId)}`);
   if (info.file_size && info.file_size > maxBytes) throw new Fail('too_large');
   let r;
-  try { r = await fetch(`${TG_API}/file/bot${BOT_TOKEN}/${info.file_path}`); }
+  try { r = await fetch(`${TG_API}/file/bot${BOT_TOKEN}/${info.file_path}`, { signal: AbortSignal.timeout(45_000) }); }
   catch (e) { throw new TgErr(`network: ${e.message}`, false); }
   if (!r.ok) throw new TgErr(`download HTTP ${r.status}`, r.status < 500);
-  const buf = Buffer.from(await r.arrayBuffer());
+  let buf;
+  try { buf = Buffer.from(await r.arrayBuffer()); } catch (e) { throw new TgErr(`network: ${e.message}`, false); }
   if (buf.length > maxBytes) throw new Fail('too_large');
   return buf;
 }
@@ -373,14 +374,21 @@ function enqueueBg(fileId, kind, userId) {
   for (const [k, j] of bg) if (j.state !== 'queued' && j.state !== 'running' && now - j.at > BG_TTL_MS) bg.delete(k);
   if (bg.size >= BG_MAX) for (const [k, j] of bg) { if (j.state === 'done' || j.state === 'failed') { bg.delete(k); if (bg.size < BG_MAX * 0.9) break; } }
   let job = bg.get(key);
+  if (job && job.state === 'running' && now - (job.startedAt ?? now) > 4 * 60_000) job = null;   // گیرکرده؛ از نو
   if (job && (job.state === 'queued' || job.state === 'running' || job.state === 'done' || job.state === 'failed')) {
     if (job.userId === userId || job.state !== 'done') return job;   // فایل آپلودشده فقط برای همون کاربر معتبره
   }
   job = { state: 'queued', userId, at: now };
   bg.set(key, job);
-  bgSchedule(async () => { job.state = 'running'; await runBgJob(key, job, fileId, kind); })
+  bgSchedule(async () => { job.state = 'running'; job.startedAt = Date.now(); await runBgJob(key, job, fileId, kind); })
     .catch((e) => { job.state = 'retry'; job.error = String(e?.message || e); });
   return job;
+}
+
+function bgCounts() {
+  const c = { queued: 0, running: 0, done: 0, failed: 0, retry: 0 };
+  for (const j of bg.values()) c[j.state] = (c[j.state] ?? 0) + 1;
+  return c;
 }
 
 const view = (j) => (j
@@ -435,7 +443,7 @@ const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://x');
 
     if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/health')) {
-      return json(res, 200, { ok: true, service: 'monarch-media', active, queued: waiting.length, cached: jobs.size, tg: Boolean(BOT_TOKEN), bg: bg.size });
+      return json(res, 200, { ok: true, service: 'monarch-media', active, queued: waiting.length, cached: jobs.size, tg: Boolean(BOT_TOKEN), bg: bgCounts() });
     }
 
     if (req.method === 'POST' && url.pathname === '/convert') {
