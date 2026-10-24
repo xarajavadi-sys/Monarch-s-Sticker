@@ -263,6 +263,32 @@ async function schedule(fn) {
   }
 }
 
+// ───────── کش و هم‌پوشانی کارها ─────────
+// ربات سرورلس مهلت کوتاهی داره و ممکنه وسط انتظار قطع بشه؛ بعداً همون فایل رو دوباره می‌فرسته.
+// پس نتیجه‌ی هر فایل (بر اساس هش محتوا) چند دقیقه نگه داشته می‌شه و درخواست تکراری به همون کار وصل می‌شه.
+const JOB_TTL_MS = 30 * 60_000;
+const JOB_MAX = 150;
+const jobs = new Map();   // key → { promise, result, at }
+async function convertDeduped(bytes, kind) {
+  const key = createHash('sha256').update(kind).update(bytes).digest('hex');
+  const now = Date.now();
+  for (const [k, j] of jobs) if (j.result && now - j.at > JOB_TTL_MS) jobs.delete(k);
+  while (jobs.size >= JOB_MAX) {                       // قدیمی‌ترین نتیجه‌ی تمام‌شده حذف می‌شه
+    const oldest = [...jobs].find(([, j]) => j.result);
+    if (!oldest) break;
+    jobs.delete(oldest[0]);
+  }
+  let job = jobs.get(key);
+  if (job) return job.promise;
+  job = { at: now, result: null, promise: null };
+  job.promise = schedule(() => convert(bytes, kind)).then(
+    (r) => { job.result = r; job.at = Date.now(); return r; },
+    (e) => { jobs.delete(key); throw e; },     // busy و خطاهای گذرا کش نمی‌شن
+  );
+  jobs.set(key, job);
+  return job.promise;
+}
+
 // ───────── HTTP ─────────
 const sha = (s) => createHash('sha256').update(s).digest();
 function keyOk(given) {
@@ -305,7 +331,7 @@ const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://x');
 
     if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/health')) {
-      return json(res, 200, { ok: true, service: 'monarch-media', active, queued: waiting.length });
+      return json(res, 200, { ok: true, service: 'monarch-media', active, queued: waiting.length, cached: jobs.size });
     }
 
     if (req.method === 'POST' && url.pathname === '/convert') {
@@ -316,7 +342,7 @@ const server = http.createServer(async (req, res) => {
       const max = PROFILES[kind].video ? LIMITS.videoInputBytes : LIMITS.staticInputBytes;
       const bytes = await readBody(req, max);
 
-      const result = await schedule(() => convert(bytes, kind));
+      const result = await convertDeduped(bytes, kind);
       return json(res, 200, result);
     }
 
