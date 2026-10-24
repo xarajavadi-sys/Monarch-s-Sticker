@@ -1,5 +1,5 @@
 // سرویس تبدیل مدیا برای Monarch Stickerbot
-//   POST /convert?kind=static|video   (بدنه: بایت‌های خام فایل، هدر x-api-key)
+//   POST /convert?kind=static|video|thumb_static|thumb_video   (بدنه: بایت‌های خام فایل، هدر x-api-key)
 //   GET  /health
 // بدون هیچ وابستگی npm؛ فقط Node 18+ و ffmpeg/ffprobe.
 //
@@ -117,10 +117,21 @@ const decoderArgs = (m) =>
   : m.isWebm && m.codec === 'vp8' ? ['-c:v', 'libvpx']
   : [];
 
-const SCALE = 'scale=512:512:force_original_aspect_ratio=decrease:force_divisible_by=2';
+// پروفایل خروجی هر kind
+//   thumb_*: آیکون پک؛ تلگرام اندازه‌ی دقیقاً ۱۰۰×۱۰۰ می‌خواد (با حاشیه‌ی شفاف)
+const PROFILES = {
+  static:       { size: 512, pad: false, video: false, outBytes: LIMITS.staticOutBytes },
+  video:        { size: 512, pad: false, video: true,  outBytes: LIMITS.videoOutBytes },
+  thumb_static: { size: 100, pad: true,  video: false, outBytes: 128 * 1024 },
+  thumb_video:  { size: 100, pad: true,  video: true,  outBytes: 30 * 1024 },   // سقف تلگرام ۳۲KB
+};
+
+const scaleFilter = (p) =>
+  `scale=${p.size}:${p.size}:force_original_aspect_ratio=decrease:force_divisible_by=2` +
+  (p.pad ? `,format=yuva420p,pad=${p.size}:${p.size}:(ow-iw)/2:(oh-ih)/2:color=black@0` : '');
 
 // ───────── استیکر ثابت ─────────
-async function makeStatic(input, dir, m) {
+async function makeStatic(input, dir, m, p) {
   const out = join(dir, 'out.webp');
   let last = 0;
   for (const q of STATIC_QUALITIES) {
@@ -128,13 +139,13 @@ async function makeStatic(input, dir, m) {
       '-nostdin', '-y', '-v', 'error', '-protocol_whitelist', 'file',
       ...decoderArgs(m), '-i', input,
       '-map', '0:v:0', '-frames:v', '1', '-an', '-sn',
-      '-vf', `${SCALE},format=yuva420p`,
+      '-vf', `${scaleFilter(p)},format=yuva420p`,
       '-c:v', 'libwebp', '-quality', String(q), '-compression_level', '6',
       out,
     ]);
     if (r.code !== 0) throw new Fail('failed');
     last = (await stat(out)).size;
-    if (last <= LIMITS.staticOutBytes) {
+    if (last <= p.outBytes) {
       return { file: out, mime: 'image/webp' };
     }
   }
@@ -146,18 +157,18 @@ async function makeStatic(input, dir, m) {
 //  ۳ تا ۳.۱ ثانیه     : فقط ته ویدیو بریده می‌شه
 //  ۳.۱ تا ۴ ثانیه     : سریع‌تر پخش می‌شه تا دقیقاً ۳ ثانیه بشه
 //  > ۴ ثانیه          : رد می‌شه
-async function makeVideo(input, dir, m) {
+async function makeVideo(input, dir, m, p) {
   const d = m.duration;
   if (d > LIMITS.videoMaxInputSec + 0.05) throw new Fail('too_long');
 
   const needsTrim = d > LIMITS.videoOutSec;
   const speedUp = d > 3.1;                       // ۳.۱ تا ۴
-  const pixFmt = m.isWebm || m.codec === 'gif' ? 'yuva420p' : 'yuv420p';
+  const pixFmt = p.pad || m.isWebm || m.codec === 'gif' ? 'yuva420p' : 'yuv420p';
   const out = join(dir, 'out.webm');
 
   const outSec = Math.min(d, LIMITS.videoOutSec) || 1;
   // ۹۰٪ سقف حجم (جا برای container و نوسان VBR) تقسیم بر مدت = بیت‌ریت هدف
-  const budgetBps = Math.floor((LIMITS.videoOutBytes * 8 * 0.9) / outSec);
+  const budgetBps = Math.floor((p.outBytes * 8 * 0.9) / outSec);
 
   for (const step of VIDEO_STEPS) {
     const bps = Math.max(40_000, Math.floor(budgetBps * step.br));
@@ -165,7 +176,7 @@ async function makeVideo(input, dir, m) {
     if (speedUp) filters.push(`setpts=PTS*${(LIMITS.videoOutSec / d).toFixed(6)}`);
     const fps = Math.min(m.fps, step.fps, 30);
     if (fps < m.fps - 0.01) filters.push(`fps=${fps}`);
-    filters.push(SCALE, `format=${pixFmt}`);
+    filters.push(scaleFilter(p), `format=${pixFmt}`);
 
     const args = [
       '-nostdin', '-y', '-v', 'error', '-protocol_whitelist', 'file',
@@ -181,7 +192,7 @@ async function makeVideo(input, dir, m) {
     const r = await run('ffmpeg', args);
     if (r.code !== 0) throw new Fail('failed');
     const size = (await stat(out)).size;
-    if (size <= LIMITS.videoOutBytes) return { file: out, mime: 'video/webm' };
+    if (size <= p.outBytes) return { file: out, mime: 'video/webm' };
   }
   throw new Fail('too_big_out');
 }
@@ -203,10 +214,11 @@ async function outputInfo(file) {
 
 // ───────── پردازش یک درخواست ─────────
 async function convert(bytes, kind) {
+  const p = PROFILES[kind];
   if (bytes.length < 16) throw new Fail('unsupported');
   if (bytes[0] === 0x1f && bytes[1] === 0x8b) throw new Fail('tgs'); // gzip = tgs
 
-  const limit = kind === 'video' ? LIMITS.videoInputBytes : LIMITS.staticInputBytes;
+  const limit = p.video ? LIMITS.videoInputBytes : LIMITS.staticInputBytes;
   if (bytes.length > limit) throw new Fail('too_large');
 
   const dir = await mkdtemp(join(tmpdir(), 'conv-'));
@@ -215,7 +227,7 @@ async function convert(bytes, kind) {
     await writeFile(input, bytes);
     const m = inspect(await probe(input));
 
-    const res = kind === 'video' ? await makeVideo(input, dir, m) : await makeStatic(input, dir, m);
+    const res = p.video ? await makeVideo(input, dir, m, p) : await makeStatic(input, dir, m, p);
 
     const buf = await readFile(res.file);
     const info = await outputInfo(res.file);
@@ -225,7 +237,7 @@ async function convert(bytes, kind) {
       mime: res.mime,
       width: info.width ?? null,
       height: info.height ?? null,
-      duration: kind === 'video' ? Number((info.duration ?? 0).toFixed(2)) : 0,
+      duration: p.video ? Number((info.duration ?? 0).toFixed(2)) : 0,
       size: buf.length,
       data: buf.toString('base64'),
     };
@@ -299,8 +311,9 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/convert') {
       if (!keyOk(req.headers['x-api-key'])) return json(res, 401, { ok: false, error: 'unauthorized', message: 'unauthorized' });
 
-      const kind = url.searchParams.get('kind') === 'video' ? 'video' : 'static';
-      const max = kind === 'video' ? LIMITS.videoInputBytes : LIMITS.staticInputBytes;
+      const q = url.searchParams.get('kind');
+      const kind = q in PROFILES ? q : 'static';
+      const max = PROFILES[kind].video ? LIMITS.videoInputBytes : LIMITS.staticInputBytes;
       const bytes = await readBody(req, max);
 
       const result = await schedule(() => convert(bytes, kind));
