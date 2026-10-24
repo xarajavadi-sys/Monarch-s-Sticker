@@ -17,7 +17,7 @@ import { timingSafeEqual, createHash } from 'node:crypto';
 const PORT = Number(process.env.PORT || 10000);   // Render خودش PORT رو می‌ده
 const API_KEY = process.env.MEDIA_KEY || '';
 const MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT || 2);
-const MAX_QUEUE = 20;
+const MAX_QUEUE = 60;
 
 const LIMITS = {
   staticInputBytes: 20 * 1024 * 1024,   // سقف دانلود تلگرام برای ربات
