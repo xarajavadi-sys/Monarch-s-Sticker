@@ -9,3 +9,5 @@ services:
     envVars:
       - key: MEDIA_KEY
         generateValue: true   # رندر یک رمز تصادفی می‌سازه؛ در تب Environment می‌بینیش
+      - key: BOT_TOKEN
+        sync: false           # توکن ربات (از BotFather) رو خودت توی داشبورد رندر وارد کن

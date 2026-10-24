@@ -249,9 +249,9 @@ async function convert(bytes, kind) {
 // ───────── صف ساده (حداکثر MAX_CONCURRENT کار هم‌زمان) ─────────
 let active = 0;
 const waiting = [];
-async function schedule(fn) {
+async function schedule(fn, { unbounded = false } = {}) {
   if (active >= MAX_CONCURRENT) {
-    if (waiting.length >= MAX_QUEUE) throw new Fail('busy', 503);
+    if (!unbounded && waiting.length >= MAX_QUEUE) throw new Fail('busy', 503);
     await new Promise((res) => waiting.push(res));
   }
   active++;
@@ -269,7 +269,7 @@ async function schedule(fn) {
 const JOB_TTL_MS = 30 * 60_000;
 const JOB_MAX = 150;
 const jobs = new Map();   // key → { promise, result, at }
-async function convertDeduped(bytes, kind) {
+async function convertDeduped(bytes, kind, opts = {}) {
   const key = createHash('sha256').update(kind).update(bytes).digest('hex');
   const now = Date.now();
   for (const [k, j] of jobs) if (j.result && now - j.at > JOB_TTL_MS) jobs.delete(k);
@@ -281,12 +281,116 @@ async function convertDeduped(bytes, kind) {
   let job = jobs.get(key);
   if (job) return job.promise;
   job = { at: now, result: null, promise: null };
-  job.promise = schedule(() => convert(bytes, kind)).then(
+  job.promise = schedule(() => convert(bytes, kind), opts).then(
     (r) => { job.result = r; job.at = Date.now(); return r; },
     (e) => { jobs.delete(key); throw e; },     // busy و خطاهای گذرا کش نمی‌شن
   );
   jobs.set(key, job);
   return job.promise;
+}
+
+
+// ───────── کارهای پس‌زمینه: دانلود از تلگرام ← تبدیل ← آپلود به‌عنوان فایل استیکر ─────────
+// ربات سرورلس فقط «ثبت» می‌کنه (enqueue) و بعداً وضعیت می‌پرسه (status)؛ هیچ‌وقت منتظر تبدیل نمی‌مونه.
+// نیازمند BOT_TOKEN (توکن ربات از BotFather) در متغیرهای محیطی رندر.
+const BOT_TOKEN = process.env.BOT_TOKEN || '';
+const TG_API = (process.env.TG_API || 'https://api.telegram.org').replace(/\/+$/, '');
+const BG_TTL_MS = 6 * 60 * 60_000;
+const BG_MAX = 3000;
+const bg = new Map();   // "kind:file_id" → { state, userId, stickerFileId?, error?, message?, at }
+
+class TgErr extends Error {
+  constructor(msg, permanent) { super(msg); this.permanent = permanent; }
+}
+
+async function tgCall(method, body) {
+  let r;
+  try {
+    r = await fetch(`${TG_API}/bot${BOT_TOKEN}/${method}`, body ? { method: 'POST', body } : undefined);
+  } catch (e) { throw new TgErr(`network: ${e.message}`, false); }
+  let j = null;
+  try { j = await r.json(); } catch (_) { /* غیر JSON */ }
+  if (!j?.ok) {
+    const permanent = r.status >= 400 && r.status < 500 && r.status !== 429;
+    throw new TgErr(j?.description || `HTTP ${r.status}`, permanent);
+  }
+  return j.result;
+}
+
+async function tgDownload(fileId, maxBytes) {
+  const info = await tgCall(`getFile?file_id=${encodeURIComponent(fileId)}`);
+  if (info.file_size && info.file_size > maxBytes) throw new Fail('too_large');
+  let r;
+  try { r = await fetch(`${TG_API}/file/bot${BOT_TOKEN}/${info.file_path}`); }
+  catch (e) { throw new TgErr(`network: ${e.message}`, false); }
+  if (!r.ok) throw new TgErr(`download HTTP ${r.status}`, r.status < 500);
+  const buf = Buffer.from(await r.arrayBuffer());
+  if (buf.length > maxBytes) throw new Fail('too_large');
+  return buf;
+}
+
+async function tgUploadSticker(userId, kind, bytes, mime) {
+  const form = new FormData();
+  form.set('user_id', String(userId));
+  form.set('sticker_format', kind === 'video' ? 'video' : 'static');
+  form.set('sticker', new Blob([bytes], { type: mime }), kind === 'video' ? 'sticker.webm' : 'sticker.webp');
+  return tgCall('uploadStickerFile', form);
+}
+
+async function runBgJob(key, job, fileId, kind) {
+  try {
+    const p = PROFILES[kind];
+    const max = p.video ? LIMITS.videoInputBytes : LIMITS.staticInputBytes;
+    const bytes = await tgDownload(fileId, max);
+    const out = await convertDeduped(bytes, kind, { unbounded: true });
+    if (!out.ok) { job.state = 'failed'; job.error = out.error; job.message = out.message; return; }
+    const up = await tgUploadSticker(job.userId, kind, Buffer.from(out.data, 'base64'), out.mime);
+    job.stickerFileId = up.file_id;
+    job.state = 'done';
+  } catch (e) {
+    if (e instanceof Fail) { job.state = 'failed'; job.error = e.code; job.message = E[e.code] || E.failed; }
+    else if (e instanceof TgErr && e.permanent) { job.state = 'failed'; job.error = 'tg_rejected'; job.message = /too big/i.test(e.message) ? 'حجم فایل بیشتر از ۲۰ مگابایته (سقف دانلود تلگرام).' : `تلگرام این فایل رو قبول نکرد: ${e.message}`; }
+    else { job.state = 'retry'; job.error = 'transient'; console.warn('bg job transient', key, e?.message); }
+  } finally {
+    job.at = Date.now();
+  }
+}
+
+// حداکثر چند کار پس‌زمینه هم‌زمان (هرکدوم ممکنه تا ۵ مگابایت توی حافظه نگه داره)؛ خود تبدیل جداگانه با schedule محدود می‌شه
+const BG_CONCURRENT = 4;
+let bgActive = 0;
+const bgWaiting = [];
+async function bgSchedule(fn) {
+  if (bgActive >= BG_CONCURRENT) await new Promise((res) => bgWaiting.push(res));
+  bgActive++;
+  try { return await fn(); }
+  finally { bgActive--; bgWaiting.shift()?.(); }
+}
+
+function enqueueBg(fileId, kind, userId) {
+  const key = `${kind}:${fileId}`;
+  const now = Date.now();
+  for (const [k, j] of bg) if (j.state !== 'queued' && j.state !== 'running' && now - j.at > BG_TTL_MS) bg.delete(k);
+  if (bg.size >= BG_MAX) for (const [k, j] of bg) { if (j.state === 'done' || j.state === 'failed') { bg.delete(k); if (bg.size < BG_MAX * 0.9) break; } }
+  let job = bg.get(key);
+  if (job && (job.state === 'queued' || job.state === 'running' || job.state === 'done' || job.state === 'failed')) {
+    if (job.userId === userId || job.state !== 'done') return job;   // فایل آپلودشده فقط برای همون کاربر معتبره
+  }
+  job = { state: 'queued', userId, at: now };
+  bg.set(key, job);
+  bgSchedule(async () => { job.state = 'running'; await runBgJob(key, job, fileId, kind); })
+    .catch((e) => { job.state = 'retry'; job.error = String(e?.message || e); });
+  return job;
+}
+
+const view = (j) => (j
+  ? { state: j.state, ...(j.state === 'done' ? { sticker_file_id: j.stickerFileId } : {}), ...(j.state === 'failed' || j.state === 'retry' ? { error: j.error, message: j.message } : {}) }
+  : { state: 'missing' });
+
+async function readJson(req, max = 1_000_000) {
+  const chunks = []; let n = 0;
+  for await (const c of req) { n += c.length; if (n > max) throw new Fail('too_large', 413); chunks.push(c); }
+  try { return JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch (_) { throw new Fail('unsupported', 400); }
 }
 
 // ───────── HTTP ─────────
@@ -331,7 +435,7 @@ const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://x');
 
     if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/health')) {
-      return json(res, 200, { ok: true, service: 'monarch-media', active, queued: waiting.length, cached: jobs.size });
+      return json(res, 200, { ok: true, service: 'monarch-media', active, queued: waiting.length, cached: jobs.size, tg: Boolean(BOT_TOKEN), bg: bg.size });
     }
 
     if (req.method === 'POST' && url.pathname === '/convert') {
@@ -344,6 +448,19 @@ const server = http.createServer(async (req, res) => {
 
       const result = await convertDeduped(bytes, kind);
       return json(res, 200, result);
+    }
+
+    if (req.method === 'POST' && (url.pathname === '/enqueue' || url.pathname === '/status')) {
+      if (!keyOk(req.headers['x-api-key'])) return json(res, 401, { ok: false, error: 'unauthorized', message: 'unauthorized' });
+      if (!BOT_TOKEN) return json(res, 200, { ok: false, error: 'no_token', message: 'BOT_TOKEN روی سرویس تنظیم نشده.' });
+      const body = await readJson(req);
+      const items = Array.isArray(body.items) ? body.items.slice(0, 200) : [];
+      const valid = (it) => it && typeof it.file_id === 'string' && it.file_id.length < 300 && (it.kind === 'static' || it.kind === 'video');
+      if (url.pathname === '/enqueue') {
+        const out = items.map((it) => (valid(it) ? view(enqueueBg(it.file_id, it.kind, Number(it.user_id))) : { state: 'failed', error: 'unsupported' }));
+        return json(res, 200, { ok: true, items: out });
+      }
+      return json(res, 200, { ok: true, items: items.map((it) => (valid(it) ? view(bg.get(`${it.kind}:${it.file_id}`)) : { state: 'missing' })) });
     }
 
     json(res, 404, { ok: false, error: 'not_found' });
