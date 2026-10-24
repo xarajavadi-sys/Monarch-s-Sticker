@@ -33,12 +33,12 @@ const LIMITS = {
 const STATIC_QUALITIES = [92, 85, 75, 65, 55, 45, 35, 25, 15];
 // br = ضریبی از «بودجه‌ی بیت‌ریت» که از سقف حجم محاسبه می‌شه (کنترل حجم در همون پاس اول)
 const VIDEO_STEPS = [
-  { crf: 30, fps: 30, br: 1.0 },
-  { crf: 36, fps: 30, br: 0.8 },
-  { crf: 42, fps: 30, br: 0.6 },
-  { crf: 48, fps: 24, br: 0.45 },   // فریم‌ریت از ۲۴ پایین‌تر نمی‌ره (پرش نداشته باشه)
-  { crf: 52, fps: 24, br: 0.35 },
-  { crf: 58, fps: 24, br: 0.25 },
+  { fps: 30, br: 1.0 },
+  { fps: 30, br: 0.85 },
+  { fps: 30, br: 0.7 },
+  { fps: 24, br: 0.55 },            // فریم‌ریت از ۲۴ پایین‌تر نمی‌ره (پرش نداشته باشه)
+  { fps: 24, br: 0.42 },
+  { fps: 24, br: 0.3 },
 ];
 
 // فرمت‌های ورودی مجاز (ffprobe format_name). جلوی خوندن playlist/concat و ... رو می‌گیره.
@@ -168,7 +168,7 @@ async function makeVideo(input, dir, m, p) {
 
   const outSec = Math.min(d, LIMITS.videoOutSec) || 1;
   // ۹۰٪ سقف حجم (جا برای container و نوسان VBR) تقسیم بر مدت = بیت‌ریت هدف
-  const budgetBps = Math.floor((p.outBytes * 8 * 0.9) / outSec);
+  const budgetBps = Math.floor((p.outBytes * 8 * 0.93) / outSec);
 
   for (const step of VIDEO_STEPS) {
     const bps = Math.max(40_000, Math.floor(budgetBps * step.br));
@@ -176,7 +176,7 @@ async function makeVideo(input, dir, m, p) {
     if (speedUp) filters.push(`setpts=PTS*${(LIMITS.videoOutSec / d).toFixed(6)}`);
     const fps = Math.min(m.fps, step.fps, 30);
     if (fps < m.fps - 0.01) filters.push(`fps=${fps}`);
-    filters.push(scaleFilter(p), 'hqdn3d=2:1.5:3:3', `format=${pixFmt}`);   // حذف نویز سبک: بیت‌ها خرج جزئیات واقعی می‌شن
+    filters.push(scaleFilter(p), 'hqdn3d=1.5:1:2:2', `format=${pixFmt}`);   // حذف نویز سبک: بیت‌ها خرج جزئیات واقعی می‌شن
 
     const args = [
       '-nostdin', '-y', '-v', 'error', '-protocol_whitelist', 'file',
@@ -184,7 +184,7 @@ async function makeVideo(input, dir, m, p) {
       '-map', '0:v:0', '-an', '-sn', '-dn',
       '-vf', filters.join(','),
       ...(needsTrim ? ['-t', String(LIMITS.videoOutSec)] : []),
-      '-c:v', 'libvpx-vp9', '-b:v', String(bps), '-maxrate', String(bps), '-crf', String(step.crf),
+      '-c:v', 'libvpx-vp9', '-b:v', String(bps), '-maxrate', String(bps),   // بدون -crf: کنترل کیفیت کاملاً با بیت‌ریت، تا کل سقف حجم استفاده بشه
       '-pix_fmt', pixFmt, '-auto-alt-ref', '0',
       '-row-mt', '1', '-deadline', 'realtime', '-cpu-used', '4', '-threads', '2',
       '-f', 'webm', out,
