@@ -392,27 +392,37 @@ async function runBgJob(key, job, fileId, kind) {
 // حداکثر چند کار پس‌زمینه هم‌زمان (هرکدوم ممکنه تا ۵ مگابایت توی حافظه نگه داره)؛ خود تبدیل جداگانه با schedule محدود می‌شه
 const BG_CONCURRENT = 4;
 let bgActive = 0;
-const bgWaiting = [];
-async function bgSchedule(fn) {
-  if (bgActive >= BG_CONCURRENT) await new Promise((res) => bgWaiting.push(res));
+const bgWaiting = [];          // { userId, resolve }
+let bgLastUser = null;
+// نوبت منصفانه: کاربری که ۱۲۰ فایل فرستاده نذاره بقیه معطل بمونن (به‌ترتیب بین کاربرها می‌چرخه)
+function bgPickNext() {
+  if (!bgWaiting.length) return null;
+  let i = bgWaiting.findIndex((w) => w.userId !== bgLastUser);
+  if (i < 0) i = 0;
+  const [w] = bgWaiting.splice(i, 1);
+  bgLastUser = w.userId;
+  return w;
+}
+async function bgSchedule(userId, fn) {
+  if (bgActive >= BG_CONCURRENT) await new Promise((resolve) => bgWaiting.push({ userId, resolve }));
   bgActive++;
   try { return await fn(); }
-  finally { bgActive--; bgWaiting.shift()?.(); }
+  finally { bgActive--; bgPickNext()?.resolve(); }
 }
 
 function enqueueBg(fileId, kind, userId) {
-  const key = `${kind}:${fileId}`;
+  const key = `${userId}:${kind}:${fileId}`;          // کلید شامل کاربره: فایل آپلودشده فقط برای صاحبش معتبره
   const now = Date.now();
   for (const [k, j] of bg) if (j.state !== 'queued' && j.state !== 'running' && now - j.at > BG_TTL_MS) bg.delete(k);
   if (bg.size >= BG_MAX) for (const [k, j] of bg) { if (j.state === 'done' || j.state === 'failed') { bg.delete(k); if (bg.size < BG_MAX * 0.9) break; } }
   let job = bg.get(key);
   if (job && job.state === 'running' && now - (job.startedAt ?? now) > 4 * 60_000) job = null;   // گیرکرده؛ از نو
   if (job && (job.state === 'queued' || job.state === 'running' || job.state === 'done' || job.state === 'failed')) {
-    if (job.userId === userId || job.state !== 'done') return job;   // فایل آپلودشده فقط برای همون کاربر معتبره
+    return job;
   }
   job = { state: 'queued', userId, at: now };
   bg.set(key, job);
-  bgSchedule(async () => { job.state = 'running'; job.startedAt = Date.now(); await runBgJob(key, job, fileId, kind); })
+  bgSchedule(userId, async () => { job.state = 'running'; job.startedAt = Date.now(); await runBgJob(key, job, fileId, kind); })
     .catch((e) => { job.state = 'retry'; job.error = String(e?.message || e); });
   return job;
 }
@@ -432,6 +442,187 @@ async function readJson(req, max = 1_000_000) {
   for await (const c of req) { n += c.length; if (n > max) throw new Fail('too_large', 413); chunks.push(c); }
   try { return JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch (_) { throw new Fail('unsupported', 400); }
 }
+
+
+// ───────── ساخت کامل پک سمت سرویس ─────────
+// ربات فقط درخواست ساخت می‌فرسته؛ سرویس فایل‌ها رو آماده می‌کنه، پک رو می‌سازه و لینک رو مستقیم برای کاربر می‌فرسته
+// (کاربر لازم نیست منتظر بمونه). وضعیت توی حافظه‌ست؛ ربات بعداً با /build/status می‌پرسه و حسابداری رو انجام می‌ده.
+const builds = new Map();          // "userId:name" → وضعیت ساخت
+const BUILD_TTL_MS = 6 * 60 * 60_000;
+const FIRST_STATIC = 20;           // تعداد اولیه‌ی createNewStickerSet
+const FIRST_VIDEO = 5;
+const MAX_PER_PACK = 120;
+
+async function tgJson(method, obj) {
+  let r;
+  try {
+    r = await fetch(`${TG_API}/bot${BOT_TOKEN}/${method}`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(obj),
+      signal: AbortSignal.timeout(60_000),
+    });
+  } catch (e) { throw new TgErr(`network: ${e.message}`, false); }
+  let j = null;
+  try { j = await r.json(); } catch (_) { /* غیر JSON */ }
+  if (!j?.ok) {
+    const err = new TgErr(j?.description || `HTTP ${r.status}`, r.status >= 400 && r.status < 500 && r.status !== 429);
+    err.code = j?.error_code ?? r.status;
+    err.retryAfter = j?.parameters?.retry_after;
+    throw err;
+  }
+  return j.result;
+}
+
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// فراخوانی تلگرام با تلاش مجدد برای ۴۲۹ و خطاهای شبکه
+async function tgRetry(method, obj, tries = 5) {
+  for (let i = 0; ; i++) {
+    try { return await tgJson(method, obj); }
+    catch (e) {
+      const wait = e.code === 429 ? Math.min(Number(e.retryAfter ?? 5), 60) * 1000 + 300 : (!e.permanent ? 2000 * (i + 1) : 0);
+      if (!(e instanceof TgErr) || !wait || i >= tries - 1) throw e;
+      await sleepMs(wait);
+    }
+  }
+}
+
+const notify = (chatId, text, extra = {}) => tgJson('sendMessage', { chat_id: chatId, text, ...extra }).catch((e) => console.warn('notify failed', e?.message));
+
+function buildKey(userId, name) { return `${Number(userId)}:${String(name).toLowerCase()}`; }
+
+async function runBuild(b) {
+  try {
+    // ۱) ثبت همه‌ی فایل‌ها برای تبدیل (فایل‌هایی که قبلاً ثبت شدن دوباره کار نمی‌شن)
+    b.phase = 'preparing';
+    const keyOf = (it) => `${b.userId}:${it.kind}:${it.file_id}`;
+    for (const it of b.items) enqueueBg(it.file_id, it.kind, b.userId);
+    const retries = new Map();
+    while (true) {
+      let pending = 0; let ready = 0;
+      for (const it of b.items) {
+        const j = bg.get(keyOf(it));
+        if (j?.state === 'done') ready++;
+        else if (j?.state === 'failed') { /* نهایی */ }
+        else if (j?.state === 'retry' || !j) {
+          const n = (retries.get(keyOf(it)) ?? 0) + 1; retries.set(keyOf(it), n);
+          if (n <= 4) { enqueueBg(it.file_id, it.kind, b.userId); pending++; }
+        } else pending++;
+      }
+      b.ready = ready;
+      if (!pending) break;
+      await sleepMs(2000);
+    }
+
+    const okItems = []; const bad = [];
+    for (const it of b.items) {
+      const j = bg.get(keyOf(it));
+      if (j?.state === 'done') okItems.push({ ...it, sticker: j.stickerFileId });
+      else bad.push({ message_id: it.message_id, message: j?.message || 'تبدیل ناموفق بود.' });
+    }
+    b.failedItems = bad;
+    if (!okItems.length) throw new BuildFail('all_failed', 'هیچ‌کدوم از فایل‌ها آماده نشد.');
+
+    // ۲) ساخت پک (دسته‌ی کوچک)، یا ادامه‌ی پک نیمه‌کاره
+    b.phase = 'creating';
+    const input = (it) => ({ sticker: it.sticker, format: b.kind, emoji_list: b.emoji });
+    let next = 0;
+    const firstN = b.kind === 'video' ? FIRST_VIDEO : FIRST_STATIC;
+    try {
+      await tgRetry('createNewStickerSet', { user_id: b.userId, name: b.name, title: b.title, stickers: okItems.slice(0, firstN).map(input) });
+      next = Math.min(firstN, okItems.length);
+    } catch (e) {
+      if (e instanceof TgErr && /occupied|already/i.test(e.message)) {
+        if (!b.resume) throw new BuildFail('name_taken', 'این نام همین الان گرفته شد.');
+        const set = await tgRetry('getStickerSet', { name: b.name });     // ادامه‌ی پک نیمه‌کاره
+        next = Math.max(1, Math.min(set.stickers.length, okItems.length));
+      } else throw e;
+    }
+
+    // ۳) اضافه کردن بقیه
+    b.phase = 'adding';
+    b.added = next;
+    for (; next < okItems.length && next < MAX_PER_PACK; next++) {
+      try {
+        await tgRetry('addStickerToSet', { user_id: b.userId, name: b.name, sticker: input(okItems[next]) });
+        b.added++;
+      } catch (e) {
+        if (e instanceof TgErr && /STICKERS_TOO_MUCH|too many/i.test(e.message)) break;
+        if (e instanceof TgErr && e.permanent) { bad.push({ message_id: okItems[next].message_id, message: `تلگرام قبولش نکرد: ${e.message}` }); continue; }
+        throw e;
+      }
+      await sleepMs(250);
+    }
+
+    // ۴) نتیجه
+    const set = await tgRetry('getStickerSet', { name: b.name });
+    b.stickerCount = set.stickers.length;
+    b.staticCount = b.kind === 'static' ? b.stickerCount : 0;
+    b.videoCount = b.kind === 'static' ? 0 : b.stickerCount;
+    b.state = 'done'; b.phase = 'done'; b.at = Date.now();
+
+    const link = `https://t.me/addstickers/${b.name}`;
+    await notify(b.chatId, `🎉 پک «${b.title}» ساخته شد!\n\n${link}`, {
+      reply_markup: { inline_keyboard: [[{ text: '📦 مشاهده و افزودن پک', url: link }]] },
+    });
+    for (const f of bad.slice(0, 10)) {
+      if (!f.message_id) continue;
+      await tgJson('setMessageReaction', { chat_id: b.chatId, message_id: f.message_id, reaction: [{ type: 'emoji', emoji: '👎' }] }).catch(() => {});
+      await notify(b.chatId, `❌ این فایل توی پک نیومد: ${f.message}`, { reply_parameters: { message_id: f.message_id, allow_sending_without_reply: true } });
+    }
+    if (bad.length > 10) await notify(b.chatId, `و ${bad.length - 10} فایل دیگه هم اضافه نشد.`);
+  } catch (e) {
+    b.state = 'failed'; b.phase = 'failed'; b.at = Date.now();
+    b.error = e instanceof BuildFail ? e.code : 'error';
+    console.warn('build failed', b.userId, b.name, e?.message);
+    const why = e instanceof BuildFail ? e.message : `خطای تلگرام: ${e?.message ?? ''}`;
+    await notify(b.chatId, `❌ ساخت پک «${b.title}» ناموفق بود: ${why}\n\nاعتبارت برگردونده می‌شه. دوباره از ربات «ساخت پک جدید» رو بزن.`);
+  }
+}
+
+class BuildFail extends Error {
+  constructor(code, message) { super(message); this.code = code; }
+}
+
+function startBuild(req) {
+  const key = buildKey(req.user_id, req.name);
+  for (const [k, b] of builds) if (b.state !== 'running' && Date.now() - (b.at ?? 0) > BUILD_TTL_MS) builds.delete(k);
+  const old = builds.get(key);
+  if (old && (old.state === 'running' || old.state === 'done')) return old;     // تکراری؛ همون کار قبلی
+  const b = {
+    state: 'running', phase: 'queued', userId: Number(req.user_id), chatId: Number(req.chat_id), name: String(req.name),
+    title: String(req.title), emoji: req.emoji, kind: req.kind === 'video' ? 'video' : 'static', resume: Boolean(req.resume),
+    items: req.items, ready: 0, added: 0, failedItems: [], at: Date.now(),
+  };
+  builds.set(key, b);
+  runBuild(b).catch((e) => console.error('runBuild crashed', e));
+  return b;
+}
+
+const buildView = (b) => (b
+  ? { state: b.state, phase: b.phase, ready: b.ready, total: b.items.length, added: b.added, failed: b.failedItems.length, error: b.error,
+      ...(b.state === 'done' ? { stickerCount: b.stickerCount, staticCount: b.staticCount, videoCount: b.videoCount } : {}) }
+  : { state: 'missing' });
+
+// ───────── نگه داشتن سرویس بیدار تا کار تموم بشه + پیام قبل از ری‌استارت ─────────
+const SELF_URL = (process.env.SELF_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/+$/, '');
+const anyBusy = () => active > 0 || waiting.length > 0 || bgActive > 0 || bgWaiting.length > 0 || [...builds.values()].some((b) => b.state === 'running');
+if (SELF_URL) {
+  // Render رایگان بعد از ۱۵ دقیقه بدون درخواست ورودی می‌خوابه؛ تا وقتی کار داریم خودمون رو صدا می‌زنیم
+  setInterval(() => { if (anyBusy()) fetch(`${SELF_URL}/health`).catch(() => {}); }, 8 * 60_000).unref();
+}
+
+let shuttingDown = false;
+async function onShutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  const running = [...builds.values()].filter((b) => b.state === 'running');
+  await Promise.allSettled(running.map((b) => notify(b.chatId,
+    `⚠️ سرویس ساخت پک ری‌استارت شد و ساخت «${b.title}» نصفه موند.\nدکمه‌ی زیر رو بزن تا از همون‌جا ادامه بدم (چیزی که ساخته شده از بین نمی‌ره).`,
+    { reply_markup: { inline_keyboard: [[{ text: '▶️ ادامه‌ی ساخت', callback_data: `build:resume:${b.name}` }]] } })));
+  process.exit(0);
+}
+process.on('SIGTERM', onShutdown);
+process.on('SIGINT', onShutdown);
 
 // ───────── HTTP ─────────
 const sha = (s) => createHash('sha256').update(s).digest();
@@ -475,7 +666,7 @@ const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://x');
 
     if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/health')) {
-      return json(res, 200, { ok: true, service: 'monarch-media', active, queued: waiting.length, cached: jobs.size, tg: Boolean(BOT_TOKEN), bg: bgCounts(), vp9: `${VP9_DEADLINE}/${VP9_CPU_USED}`, maxFps: MAX_FPS });
+      return json(res, 200, { ok: true, service: 'monarch-media', active, queued: waiting.length, cached: jobs.size, tg: Boolean(BOT_TOKEN), bg: bgCounts(), builds: [...builds.values()].filter((b) => b.state === 'running').length, vp9: `${VP9_DEADLINE}/${VP9_CPU_USED}`, maxFps: MAX_FPS });
     }
 
     if (req.method === 'POST' && url.pathname === '/convert') {
@@ -500,7 +691,20 @@ const server = http.createServer(async (req, res) => {
         const out = items.map((it) => (valid(it) ? view(enqueueBg(it.file_id, it.kind, Number(it.user_id))) : { state: 'failed', error: 'unsupported' }));
         return json(res, 200, { ok: true, items: out });
       }
-      return json(res, 200, { ok: true, items: items.map((it) => (valid(it) ? view(bg.get(`${it.kind}:${it.file_id}`)) : { state: 'missing' })) });
+      return json(res, 200, { ok: true, items: items.map((it) => (valid(it) ? view(bg.get(`${Number(it.user_id)}:${it.kind}:${it.file_id}`)) : { state: 'missing' })) });
+    }
+
+    if (req.method === 'POST' && (url.pathname === '/build' || url.pathname === '/build/status')) {
+      if (!keyOk(req.headers['x-api-key'])) return json(res, 401, { ok: false, error: 'unauthorized', message: 'unauthorized' });
+      if (!BOT_TOKEN) return json(res, 200, { ok: false, error: 'no_token', message: 'BOT_TOKEN روی سرویس تنظیم نشده.' });
+      const body = await readJson(req, 2_000_000);
+      if (url.pathname === '/build/status') return json(res, 200, { ok: true, ...buildView(builds.get(buildKey(body.user_id, body.name))) });
+      const items = Array.isArray(body.items) ? body.items.slice(0, MAX_PER_PACK) : [];
+      const valid = Number.isInteger(Number(body.user_id)) && Number.isInteger(Number(body.chat_id)) && /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(String(body.name || ''))
+        && body.title && Array.isArray(body.emoji) && body.emoji.length && items.length
+        && items.every((it) => typeof it.file_id === 'string' && (it.kind === 'static' || it.kind === 'video'));
+      if (!valid) return json(res, 200, { ok: false, error: 'bad_request', message: 'درخواست نامعتبر.' });
+      return json(res, 200, { ok: true, ...buildView(startBuild({ ...body, items, kind: items[0].kind })) });
     }
 
     json(res, 404, { ok: false, error: 'not_found' });
