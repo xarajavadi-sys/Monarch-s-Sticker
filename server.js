@@ -21,11 +21,11 @@ const MAX_QUEUE = 60;
 
 // تنظیمات انکودر VP9 (با متغیر محیطی Render عوض می‌شه، بدون تغییر کد)
 //   VP9_DEADLINE = good | realtime        (پیش‌فرض good: کندتر ولی فشرده‌سازی بهتر)
-//   VP9_CPU_USED = 0..5 برای good، 0..8 برای realtime   (پیش‌فرض 5)
-//   MAX_FPS      = سقف فریم‌ریت خروجی ویدیو (پیش‌فرض 36؛ برای برگشت به سقف رسمی تلگرام بذار 30)
+//   VP9_CPU_USED = 0..5 برای good، 0..8 برای realtime   (پیش‌فرض 3)
+//   MAX_FPS      = سقف فریم‌ریت خروجی ویدیو (پیش‌فرض 30 = سقف رسمی تلگرام)
 const VP9_DEADLINE = process.env.VP9_DEADLINE === 'realtime' ? 'realtime' : 'good';
-const VP9_CPU_USED = String(Number(process.env.VP9_CPU_USED ?? 5));
-const MAX_FPS = Math.min(60, Math.max(24, Number(process.env.MAX_FPS ?? 36)));
+const VP9_CPU_USED = String(Number(process.env.VP9_CPU_USED ?? 3));
+const MAX_FPS = Math.min(60, Math.max(24, Number(process.env.MAX_FPS ?? 30)));
 
 const LIMITS = {
   staticInputBytes: 20 * 1024 * 1024,   // سقف دانلود تلگرام برای ربات
