@@ -19,6 +19,14 @@ const API_KEY = process.env.MEDIA_KEY || '';
 const MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT || 2);
 const MAX_QUEUE = 60;
 
+// تنظیمات انکودر VP9 (با متغیر محیطی Render عوض می‌شه، بدون تغییر کد)
+//   VP9_DEADLINE = good | realtime        (پیش‌فرض good: کندتر ولی فشرده‌سازی بهتر)
+//   VP9_CPU_USED = 0..5 برای good، 0..8 برای realtime   (پیش‌فرض 5)
+//   MAX_FPS      = سقف فریم‌ریت خروجی ویدیو (پیش‌فرض 36؛ برای برگشت به سقف رسمی تلگرام بذار 30)
+const VP9_DEADLINE = process.env.VP9_DEADLINE === 'realtime' ? 'realtime' : 'good';
+const VP9_CPU_USED = String(Number(process.env.VP9_CPU_USED ?? 5));
+const MAX_FPS = Math.min(60, Math.max(24, Number(process.env.MAX_FPS ?? 36)));
+
 const LIMITS = {
   staticInputBytes: 20 * 1024 * 1024,   // سقف دانلود تلگرام برای ربات
   videoInputBytes: 5 * 1024 * 1024,     // طبق قوانین پک: ورودی ویدیو حداکثر ۵ مگابایت
@@ -26,6 +34,7 @@ const LIMITS = {
   videoOutBytes: 254 * 1024,            // سقف تلگرام ۲۵۶KB؛ کمی کمتر برای اطمینان
   videoMaxInputSec: 4,                  // بیشتر از این رد می‌شه
   videoOutSec: 3,                       // سقف تلگرام برای استیکر ویدیویی
+  videoTargetSec: 2.95,                 // هدف کمی کمتر از ۳ ثانیه (حاشیه‌ی خطای گرد کردن)
   ffmpegTimeoutMs: 90_000,
 };
 
@@ -108,6 +117,8 @@ function inspect(info) {
     duration,
     fps: parseRate(v.avg_frame_rate) || parseRate(v.r_frame_rate) || 30,
     isWebm: names.includes('webm') || names.includes('matroska'),
+    // آلفای واقعی: webm با alpha_mode، پیکسل‌فرمت آلفادار، یا گیف/apng (شفافیت دارن)
+    alpha: v.tags?.alpha_mode === '1' || /yuva|rgba|bgra|argb|abgr|gbrap|ya8|ya16|pal8/.test(String(v.pix_fmt || '')) || v.codec_name === 'gif' || v.codec_name === 'apng',
   };
 }
 
@@ -157,42 +168,52 @@ async function makeStatic(input, dir, m, p) {
 //  ۳ تا ۳.۱ ثانیه     : فقط ته ویدیو بریده می‌شه
 //  ۳.۱ تا ۴ ثانیه     : سریع‌تر پخش می‌شه تا دقیقاً ۳ ثانیه بشه
 //  > ۴ ثانیه          : رد می‌شه
-async function makeVideo(input, dir, m, p) {
+async function makeVideo(input, dir, m, p, opts = {}) {
   const d = m.duration;
   if (d > LIMITS.videoMaxInputSec + 0.05) throw new Fail('too_long');
 
-  const needsTrim = d > LIMITS.videoOutSec;
-  const speedUp = d > 3.1;                       // ۳.۱ تا ۴
-  const pixFmt = p.pad || m.isWebm || m.codec === 'gif' ? 'yuva420p' : 'yuv420p';
+  const target = LIMITS.videoTargetSec;               // ۲٫۹۵ ثانیه
+  const needsTrim = d > target && d <= 3.1;           // ۲٫۹۵ تا ۳٫۱: فقط ته ویدیو بریده می‌شه
+  const speedUp = d > 3.1;                            // ۳٫۱ تا ۴: سریع‌تر پخش می‌شه (هیچ فریمی دور ریخته نمی‌شه)
+  const alpha = p.pad || m.alpha;
+  const pixFmt = alpha ? 'yuva420p' : 'yuv420p';
   const out = join(dir, 'out.webm');
 
-  const outSec = Math.min(d, LIMITS.videoOutSec) || 1;
-  // ۹۰٪ سقف حجم (جا برای container و نوسان VBR) تقسیم بر مدت = بیت‌ریت هدف
+  const outSec = Math.min(d, target) || 1;
+  // ۹۳٪ سقف حجم (جا برای container و نوسان) تقسیم بر مدت = بیت‌ریت هدف
   const budgetBps = Math.floor((p.outBytes * 8 * 0.93) / outSec);
+
+  // فریم‌ریت واقعی بعد از تند کردن (مثلاً ۱۰۴ فریم توی ۲٫۹۵ ثانیه ≈ ۳۵٫۲)
+  const effFps = (m.fps || 30) * (speedUp ? d / target : 1);
+  const fpsCap = Math.min(opts.fpsCap ?? MAX_FPS, 60);
+  let usedFps = effFps;
 
   for (const step of VIDEO_STEPS) {
     const bps = Math.max(40_000, Math.floor(budgetBps * step.br));
     const filters = [];
-    if (speedUp) filters.push(`setpts=PTS*${(LIMITS.videoOutSec / d).toFixed(6)}`);
-    const fps = Math.min(m.fps, step.fps, 30);
-    if (fps < m.fps - 0.01) filters.push(`fps=${fps}`);
-    filters.push(scaleFilter(p), 'hqdn3d=1.5:1:2:2', `format=${pixFmt}`);   // حذف نویز سبک: بیت‌ها خرج جزئیات واقعی می‌شن
+    if (speedUp) filters.push(`setpts=PTS*${(target / d).toFixed(6)}`);
+    const cap = Math.min(fpsCap, step.fps === 30 ? fpsCap : step.fps);
+    usedFps = Math.min(effFps, cap);
+    if (effFps > cap + 0.01) filters.push(`fps=${cap}`);           // فقط وقتی از سقف بیشتر باشه
+    filters.push(scaleFilter(p), `format=${pixFmt}`);
 
     const args = [
       '-nostdin', '-y', '-v', 'error', '-protocol_whitelist', 'file',
       ...decoderArgs(m), '-i', input,
       '-map', '0:v:0', '-an', '-sn', '-dn',
       '-vf', filters.join(','),
-      ...(needsTrim ? ['-t', String(LIMITS.videoOutSec)] : []),
-      '-c:v', 'libvpx-vp9', '-b:v', String(bps), '-maxrate', String(bps),   // بدون -crf: کنترل کیفیت کاملاً با بیت‌ریت، تا کل سقف حجم استفاده بشه
-      '-pix_fmt', pixFmt, '-auto-alt-ref', '0',
-      '-row-mt', '1', '-deadline', 'realtime', '-cpu-used', '4', '-threads', '2',
+      '-fps_mode', 'passthrough',                                  // زمان‌بندی فریم‌ها دست‌نخورده؛ هیچ فریمی حذف/تکرار نمی‌شه
+      ...(needsTrim || speedUp ? ['-t', String(target)] : []),
+      '-c:v', 'libvpx-vp9', '-b:v', String(bps), '-maxrate', String(bps),   // بدون -crf: کیفیت با بیت‌ریت تعیین می‌شه
+      '-pix_fmt', pixFmt,
+      ...(alpha ? ['-auto-alt-ref', '0'] : []),                    // فقط برای شفافیت لازمه؛ بدون آلفا فشرده‌سازی بهتره
+      '-row-mt', '1', '-deadline', VP9_DEADLINE, '-cpu-used', VP9_CPU_USED, '-threads', '2',
       '-f', 'webm', out,
     ];
     const r = await run('ffmpeg', args);
     if (r.code !== 0) throw new Fail('failed');
     const size = (await stat(out)).size;
-    if (size <= p.outBytes) return { file: out, mime: 'video/webm' };
+    if (size <= p.outBytes) return { file: out, mime: 'video/webm', fps: Number(usedFps.toFixed(2)) };
   }
   throw new Fail('too_big_out');
 }
@@ -213,7 +234,7 @@ async function outputInfo(file) {
 }
 
 // ───────── پردازش یک درخواست ─────────
-async function convert(bytes, kind) {
+async function convert(bytes, kind, opts = {}) {
   const p = PROFILES[kind];
   if (bytes.length < 16) throw new Fail('unsupported');
   if (bytes[0] === 0x1f && bytes[1] === 0x8b) throw new Fail('tgs'); // gzip = tgs
@@ -227,7 +248,7 @@ async function convert(bytes, kind) {
     await writeFile(input, bytes);
     const m = inspect(await probe(input));
 
-    const res = p.video ? await makeVideo(input, dir, m, p) : await makeStatic(input, dir, m, p);
+    const res = p.video ? await makeVideo(input, dir, m, p, opts) : await makeStatic(input, dir, m, p);
 
     const buf = await readFile(res.file);
     const info = await outputInfo(res.file);
@@ -238,6 +259,7 @@ async function convert(bytes, kind) {
       width: info.width ?? null,
       height: info.height ?? null,
       duration: p.video ? Number((info.duration ?? 0).toFixed(2)) : 0,
+      fps: res.fps ?? null,
       size: buf.length,
       data: buf.toString('base64'),
     };
@@ -270,7 +292,7 @@ const JOB_TTL_MS = 30 * 60_000;
 const JOB_MAX = 150;
 const jobs = new Map();   // key → { promise, result, at }
 async function convertDeduped(bytes, kind, opts = {}) {
-  const key = createHash('sha256').update(kind).update(bytes).digest('hex');
+  const key = createHash('sha256').update(`${kind}#${opts.fpsCap ?? ''}`).update(bytes).digest('hex');
   const now = Date.now();
   for (const [k, j] of jobs) if (j.result && now - j.at > JOB_TTL_MS) jobs.delete(k);
   while (jobs.size >= JOB_MAX) {                       // قدیمی‌ترین نتیجه‌ی تمام‌شده حذف می‌شه
@@ -281,7 +303,7 @@ async function convertDeduped(bytes, kind, opts = {}) {
   let job = jobs.get(key);
   if (job) return job.promise;
   job = { at: now, result: null, promise: null };
-  job.promise = schedule(() => convert(bytes, kind), opts).then(
+  job.promise = schedule(() => convert(bytes, kind, opts), { unbounded: opts.unbounded }).then(
     (r) => { job.result = r; job.at = Date.now(); return r; },
     (e) => { jobs.delete(key); throw e; },     // busy و خطاهای گذرا کش نمی‌شن
   );
@@ -343,9 +365,19 @@ async function runBgJob(key, job, fileId, kind) {
     const p = PROFILES[kind];
     const max = p.video ? LIMITS.videoInputBytes : LIMITS.staticInputBytes;
     const bytes = await tgDownload(fileId, max);
-    const out = await convertDeduped(bytes, kind, { unbounded: true });
+    let out = await convertDeduped(bytes, kind, { unbounded: true });
     if (!out.ok) { job.state = 'failed'; job.error = out.error; job.message = out.message; return; }
-    const up = await tgUploadSticker(job.userId, kind, Buffer.from(out.data, 'base64'), out.mime);
+    let up;
+    try {
+      up = await tgUploadSticker(job.userId, kind, Buffer.from(out.data, 'base64'), out.mime);
+    } catch (e) {
+      // فریم‌ریت بالای ۳۰ رد شد؟ یک بار با سقف رسمی ۳۰ دوباره می‌سازیم
+      if (!(e instanceof TgErr && e.permanent && kind === 'video' && out.fps > 30.01)) throw e;
+      console.warn('upload rejected at', out.fps, 'fps → retry at 30:', e.message);
+      out = await convertDeduped(bytes, kind, { unbounded: true, fpsCap: 30 });
+      if (!out.ok) { job.state = 'failed'; job.error = out.error; job.message = out.message; return; }
+      up = await tgUploadSticker(job.userId, kind, Buffer.from(out.data, 'base64'), out.mime);
+    }
     job.stickerFileId = up.file_id;
     job.state = 'done';
   } catch (e) {
@@ -443,7 +475,7 @@ const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://x');
 
     if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/health')) {
-      return json(res, 200, { ok: true, service: 'monarch-media', active, queued: waiting.length, cached: jobs.size, tg: Boolean(BOT_TOKEN), bg: bgCounts() });
+      return json(res, 200, { ok: true, service: 'monarch-media', active, queued: waiting.length, cached: jobs.size, tg: Boolean(BOT_TOKEN), bg: bgCounts(), vp9: `${VP9_DEADLINE}/${VP9_CPU_USED}`, maxFps: MAX_FPS });
     }
 
     if (req.method === 'POST' && url.pathname === '/convert') {
