@@ -490,25 +490,105 @@ const notify = (chatId, text, extra = {}) => tgJson('sendMessage', { chat_id: ch
 
 function buildKey(userId, name) { return `${Number(userId)}:${String(name).toLowerCase()}`; }
 
+// ───── نوار پیشرفت (یک پیام که سرویس خودش ویرایشش می‌کنه) ─────
+const PREP_WEIGHT = 0.85;                       // سهم آماده‌سازی فایل‌ها از کل کار؛ بقیه افزودن به پک
+const faNum = (n) => String(n).replace(/\d/g, (d) => '۰۱۲۳۴۵۶۷۸۹'[d]);
+
+function buildPercent(b) {
+  const n = Math.max(1, b.items.length);
+  const prep = Math.min(1, (b.ready + (b.failedCount ?? 0)) / n);
+  const add = b.phase === 'adding' || b.phase === 'done' ? Math.min(1, b.added / Math.max(1, b.addTotal || n)) : 0;
+  if (b.phase === 'done') return 100;
+  return Math.min(99, Math.round((PREP_WEIGHT * prep + (1 - PREP_WEIGHT) * add) * 100));
+}
+
+function buildEta(b) {
+  const p = buildPercent(b) / 100;
+  const el = (Date.now() - b.startedAt) / 1000;
+  if (p < 0.05 || el < 15) return null;
+  return Math.round(el * (1 - p) / p);
+}
+
+const etaText = (sec) => {
+  if (sec == null) return 'در حال محاسبه…';
+  if (sec < 45) return 'کمتر از یک دقیقه';
+  const m = Math.round(sec / 60);
+  return m >= 60 ? `حدود ${faNum(Math.round(m / 6) / 10)} ساعت` : `حدود ${faNum(m)} دقیقه`;
+};
+
+const bar = (pct, cells = 12) => {
+  const full = Math.round((pct / 100) * cells);
+  return '▰'.repeat(full) + '▱'.repeat(cells - full);
+};
+
+function progressMessage(b) {
+  const pct = b.state === 'done' ? 100 : buildPercent(b);
+  const phase = b.phase === 'adding' ? `افزودن استیکرها: ${faNum(b.added)} از ${faNum(b.addTotal || b.items.length)}`
+    : b.phase === 'creating' ? 'ساخت پک روی تلگرام'
+    : `آماده‌سازی فایل‌ها: ${faNum(b.ready)} از ${faNum(b.items.length)}`;
+  return `⏳ در حال ساخت «${b.title}»\n\n${bar(pct)}  ${faNum(pct)}٪\n${phase}\n⏱ زمان باقی‌مونده: ${etaText(buildEta(b))}\n\nلازم نیست منتظر بمونی؛ لینک پک خودکار می‌آد.`;
+}
+
+async function touchProgress(b, force = false) {
+  const now = Date.now();
+  if (!force && now - (b.progAt ?? 0) < 3500) return;
+  const text = progressMessage(b);
+  if (text === b.progText) return;
+  b.progAt = now;
+  if (!b.progId) {
+    b.progText = text;
+    const m = await tgJson('sendMessage', { chat_id: b.chatId, text }).catch((e) => { console.warn('progress send failed', e?.message); return null; });
+    b.progId = m?.message_id ?? null;
+    return;
+  }
+  b.progText = text;
+  await tgJson('editMessageText', { chat_id: b.chatId, message_id: b.progId, text })
+    .catch((e) => { if (!/not modified/i.test(e?.message ?? '')) console.warn('progress edit failed', e?.message); });
+}
+
+async function endProgress(b, text) {
+  if (b.progId) {
+    const ok = await tgJson('editMessageText', { chat_id: b.chatId, message_id: b.progId, text }).then(() => true).catch(() => false);
+    if (ok) return;
+  }
+  await notify(b.chatId, text);
+}
+
+const ITEM_KIND = (it) => (it.kind === 'video' ? 'video' : 'static');
+
 async function runBuild(b) {
   try {
+    // ادامه‌ی ساختی که قبلاً کامل شده (سرویس خوابیده بود و حافظه‌ش پاک شده): بدون تبدیل دوباره، همین‌جا تموم
+    if (b.resume) {
+      const set = await tgJson('getStickerSet', { name: b.name }).catch(() => null);
+      if (set && set.stickers.length >= Math.min(b.items.length, MAX_PER_PACK)) {
+        b.stickerCount = set.stickers.length;
+        b.videoCount = set.stickers.filter((x) => x.is_video).length;
+        b.staticCount = b.stickerCount - b.videoCount;
+        b.phase = 'done'; b.state = 'done'; b.noop = true; b.at = Date.now();
+        return;
+      }
+    }
     // ۱) ثبت همه‌ی فایل‌ها برای تبدیل (فایل‌هایی که قبلاً ثبت شدن دوباره کار نمی‌شن)
     b.phase = 'preparing';
-    const keyOf = (it) => `${b.userId}:${it.kind}:${it.file_id}`;
-    for (const it of b.items) enqueueBg(it.file_id, it.kind, b.userId);
+    await touchProgress(b, true);
+    const keyOf = (it) => `${b.userId}:${ITEM_KIND(it)}:${it.file_id}`;
+    for (const it of b.items) enqueueBg(it.file_id, ITEM_KIND(it), b.userId);
     const retries = new Map();
     while (true) {
-      let pending = 0; let ready = 0;
+      if (b.cancelled) throw new BuildFail('cancelled', 'ساخت لغو شد.');
+      let pending = 0; let ready = 0; let failedN = 0;
       for (const it of b.items) {
         const j = bg.get(keyOf(it));
         if (j?.state === 'done') ready++;
-        else if (j?.state === 'failed') { /* نهایی */ }
+        else if (j?.state === 'failed') failedN++;
         else if (j?.state === 'retry' || !j) {
           const n = (retries.get(keyOf(it)) ?? 0) + 1; retries.set(keyOf(it), n);
-          if (n <= 4) { enqueueBg(it.file_id, it.kind, b.userId); pending++; }
+          if (n <= 4) { enqueueBg(it.file_id, ITEM_KIND(it), b.userId); pending++; } else failedN++;
         } else pending++;
       }
-      b.ready = ready;
+      b.ready = ready; b.failedCount = failedN;
+      await touchProgress(b);
       if (!pending) break;
       await sleepMs(2000);
     }
@@ -516,17 +596,20 @@ async function runBuild(b) {
     const okItems = []; const bad = [];
     for (const it of b.items) {
       const j = bg.get(keyOf(it));
-      if (j?.state === 'done') okItems.push({ ...it, sticker: j.stickerFileId });
+      if (j?.state === 'done') okItems.push({ ...it, kind: ITEM_KIND(it), sticker: j.stickerFileId });
       else bad.push({ message_id: it.message_id, message: j?.message || 'تبدیل ناموفق بود.' });
     }
     b.failedItems = bad;
     if (!okItems.length) throw new BuildFail('all_failed', 'هیچ‌کدوم از فایل‌ها آماده نشد.');
+    b.addTotal = okItems.length;
 
     // ۲) ساخت پک (دسته‌ی کوچک)، یا ادامه‌ی پک نیمه‌کاره
     b.phase = 'creating';
-    const input = (it) => ({ sticker: it.sticker, format: b.kind, emoji_list: b.emoji });
+    await touchProgress(b, true);
+    const input = (it) => ({ sticker: it.sticker, format: it.kind, emoji_list: (Array.isArray(it.emoji) && it.emoji.length ? it.emoji : b.emoji) });
     let next = 0;
-    const firstN = b.kind === 'video' ? FIRST_VIDEO : FIRST_STATIC;
+    const firstN = okItems.slice(0, FIRST_STATIC).some((it) => it.kind === 'video') ? FIRST_VIDEO : FIRST_STATIC;
+    let existed = false;
     try {
       await tgRetry('createNewStickerSet', { user_id: b.userId, name: b.name, title: b.title, stickers: okItems.slice(0, firstN).map(input) });
       next = Math.min(firstN, okItems.length);
@@ -535,13 +618,17 @@ async function runBuild(b) {
         if (!b.resume) throw new BuildFail('name_taken', 'این نام همین الان گرفته شد.');
         const set = await tgRetry('getStickerSet', { name: b.name });     // ادامه‌ی پک نیمه‌کاره
         next = Math.max(1, Math.min(set.stickers.length, okItems.length));
+        existed = true;
       } else throw e;
     }
+    const startNext = next;
 
     // ۳) اضافه کردن بقیه
     b.phase = 'adding';
     b.added = next;
+    await touchProgress(b, true);
     for (; next < okItems.length && next < MAX_PER_PACK; next++) {
+      if (b.cancelled) throw new BuildFail('cancelled', 'ساخت لغو شد.');
       try {
         await tgRetry('addStickerToSet', { user_id: b.userId, name: b.name, sticker: input(okItems[next]) });
         b.added++;
@@ -550,32 +637,40 @@ async function runBuild(b) {
         if (e instanceof TgErr && e.permanent) { bad.push({ message_id: okItems[next].message_id, message: `تلگرام قبولش نکرد: ${e.message}` }); continue; }
         throw e;
       }
+      await touchProgress(b);
       await sleepMs(250);
     }
 
     // ۴) نتیجه
     const set = await tgRetry('getStickerSet', { name: b.name });
     b.stickerCount = set.stickers.length;
-    b.staticCount = b.kind === 'static' ? b.stickerCount : 0;
-    b.videoCount = b.kind === 'static' ? 0 : b.stickerCount;
-    b.state = 'done'; b.phase = 'done'; b.at = Date.now();
+    b.videoCount = set.stickers.filter((s) => s.is_video).length;
+    b.staticCount = b.stickerCount - b.videoCount;
+    b.phase = 'done'; b.state = 'done'; b.at = Date.now();
+    b.noop = Boolean(b.resume && existed && (startNext >= okItems.length || b.added === startNext));     // قبلاً کامل شده بود؛ دوباره پیام نمی‌دیم
 
-    const link = `https://t.me/addstickers/${b.name}`;
-    await notify(b.chatId, `🎉 پک «${b.title}» ساخته شد!\n\n${link}`, {
-      reply_markup: { inline_keyboard: [[{ text: '📦 مشاهده و افزودن پک', url: link }]] },
-    });
-    for (const f of bad.slice(0, 10)) {
-      if (!f.message_id) continue;
-      await tgJson('setMessageReaction', { chat_id: b.chatId, message_id: f.message_id, reaction: [{ type: 'emoji', emoji: '👎' }] }).catch(() => {});
-      await notify(b.chatId, `❌ این فایل توی پک نیومد: ${f.message}`, { reply_parameters: { message_id: f.message_id, allow_sending_without_reply: true } });
+    if (!b.noop) {
+      const link = `https://t.me/addstickers/${b.name}`;
+      await endProgress(b, `✅ ساخت «${b.title}» تموم شد (۱۰۰٪)`);
+      await notify(b.chatId, `🎉 پک «${b.title}» ساخته شد!\n\n${link}`, {
+        reply_markup: { inline_keyboard: [[{ text: '📦 مشاهده و افزودن پک', url: link }]] },
+      });
+      for (const f of bad.slice(0, 10)) {
+        if (!f.message_id) continue;
+        await tgJson('setMessageReaction', { chat_id: b.chatId, message_id: f.message_id, reaction: [{ type: 'emoji', emoji: '👎' }] }).catch(() => {});
+        await notify(b.chatId, `❌ این فایل توی پک نیومد: ${f.message}`, { reply_parameters: { message_id: f.message_id, allow_sending_without_reply: true } });
+      }
+      if (bad.length > 10) await notify(b.chatId, `و ${bad.length - 10} فایل دیگه هم اضافه نشد.`);
+    } else if (b.progId) {
+      await tgJson('deleteMessage', { chat_id: b.chatId, message_id: b.progId }).catch(() => {});
     }
-    if (bad.length > 10) await notify(b.chatId, `و ${bad.length - 10} فایل دیگه هم اضافه نشد.`);
   } catch (e) {
     b.state = 'failed'; b.phase = 'failed'; b.at = Date.now();
     b.error = e instanceof BuildFail ? e.code : 'error';
     console.warn('build failed', b.userId, b.name, e?.message);
+    if (b.error === 'cancelled') { await endProgress(b, `🛑 ساخت «${b.title}» لغو شد.`); return; }
     const why = e instanceof BuildFail ? e.message : `خطای تلگرام: ${e?.message ?? ''}`;
-    await notify(b.chatId, `❌ ساخت پک «${b.title}» ناموفق بود: ${why}\n\nاعتبارت برگردونده می‌شه. دوباره از ربات «ساخت پک جدید» رو بزن.`);
+    await endProgress(b, `❌ ساخت پک «${b.title}» ناموفق بود: ${why}\n\nاعتبارت برگردونده می‌شه. دوباره از ربات «ساخت پک جدید» رو بزن.`);
   }
 }
 
@@ -587,11 +682,12 @@ function startBuild(req) {
   const key = buildKey(req.user_id, req.name);
   for (const [k, b] of builds) if (b.state !== 'running' && Date.now() - (b.at ?? 0) > BUILD_TTL_MS) builds.delete(k);
   const old = builds.get(key);
-  if (old && (old.state === 'running' || old.state === 'done')) return old;     // تکراری؛ همون کار قبلی
+  if (old && (old.state === 'running' || (old.state === 'done' && req.resume))) return old;   // تکراری؛ همون کار قبلی
+  if (old && old.state === 'done') builds.delete(key);                                        // پک جدید با همین نام (قبلی تموم شده)
   const b = {
     state: 'running', phase: 'queued', userId: Number(req.user_id), chatId: Number(req.chat_id), name: String(req.name),
-    title: String(req.title), emoji: req.emoji, kind: req.kind === 'video' ? 'video' : 'static', resume: Boolean(req.resume),
-    items: req.items, ready: 0, added: 0, failedItems: [], at: Date.now(),
+    title: String(req.title), emoji: req.emoji, kind: ['video', 'mixed'].includes(req.kind) ? req.kind : 'static', resume: Boolean(req.resume),
+    items: req.items, ready: 0, added: 0, addTotal: 0, failedItems: [], failedCount: 0, at: Date.now(), startedAt: Date.now(), cancelled: false,
   };
   builds.set(key, b);
   runBuild(b).catch((e) => console.error('runBuild crashed', e));
@@ -600,6 +696,7 @@ function startBuild(req) {
 
 const buildView = (b) => (b
   ? { state: b.state, phase: b.phase, ready: b.ready, total: b.items.length, added: b.added, failed: b.failedItems.length, error: b.error,
+      percent: b.state === 'done' ? 100 : buildPercent(b), eta: b.state === 'running' ? buildEta(b) : null, noop: Boolean(b.noop),
       ...(b.state === 'done' ? { stickerCount: b.stickerCount, staticCount: b.staticCount, videoCount: b.videoCount } : {}) }
   : { state: 'missing' });
 
@@ -665,7 +762,17 @@ const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, 'http://x');
 
-    if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/health')) {
+    if (req.method === 'GET' && url.pathname === '/') {
+      const run = [...builds.values()].filter((b) => b.state === 'running');
+      const body = `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Monarch Media</title>` +
+        `<body style="font-family:system-ui;max-width:32rem;margin:2rem auto;padding:0 1rem;line-height:1.7">` +
+        `<h2>🟢 Monarch Media</h2><p>ساخت‌های در جریان: <b>${run.length}</b><br>تبدیل فعال: <b>${active}</b> · صف: <b>${waiting.length}</b><br>` +
+        `کارهای پس‌زمینه: <b>${bgActive}</b> فعال · <b>${bgWaiting.length}</b> در صف<br>BOT_TOKEN: <b>${BOT_TOKEN ? 'تنظیم شده' : 'تنظیم نشده ⚠️'}</b></p>` +
+        `<p style="color:#888;font-size:.85rem">این صفحه فقط خلاصه‌ی وضعیت رو نشون می‌ده؛ جزئیات هر ساخت داخل ربات (پروفایل من) دیده می‌شه.</p></body>`;
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      return res.end(body);
+    }
+    if (req.method === 'GET' && url.pathname === '/health') {
       return json(res, 200, { ok: true, service: 'monarch-media', active, queued: waiting.length, cached: jobs.size, tg: Boolean(BOT_TOKEN), bg: bgCounts(), builds: [...builds.values()].filter((b) => b.state === 'running').length, vp9: `${VP9_DEADLINE}/${VP9_CPU_USED}`, maxFps: MAX_FPS });
     }
 
@@ -694,17 +801,25 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, items: items.map((it) => (valid(it) ? view(bg.get(`${Number(it.user_id)}:${it.kind}:${it.file_id}`)) : { state: 'missing' })) });
     }
 
-    if (req.method === 'POST' && (url.pathname === '/build' || url.pathname === '/build/status')) {
+    if (req.method === 'POST' && ['/build', '/build/status', '/build/cancel'].includes(url.pathname)) {
       if (!keyOk(req.headers['x-api-key'])) return json(res, 401, { ok: false, error: 'unauthorized', message: 'unauthorized' });
       if (!BOT_TOKEN) return json(res, 200, { ok: false, error: 'no_token', message: 'BOT_TOKEN روی سرویس تنظیم نشده.' });
       const body = await readJson(req, 2_000_000);
       if (url.pathname === '/build/status') return json(res, 200, { ok: true, ...buildView(builds.get(buildKey(body.user_id, body.name))) });
-      const items = Array.isArray(body.items) ? body.items.slice(0, MAX_PER_PACK) : [];
+      if (url.pathname === '/build/cancel') {
+        const b = builds.get(buildKey(body.user_id, body.name));
+        if (b && b.state === 'running') b.cancelled = true;
+        return json(res, 200, { ok: true, cancelled: Boolean(b && b.state === 'running') });
+      }
+      const items = (Array.isArray(body.items) ? body.items.slice(0, MAX_PER_PACK) : []).map((it) => ({
+        ...it, emoji: Array.isArray(it.emoji) ? it.emoji.filter((e) => typeof e === 'string').slice(0, 20) : undefined,
+      }));
       const valid = Number.isInteger(Number(body.user_id)) && Number.isInteger(Number(body.chat_id)) && /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(String(body.name || ''))
         && body.title && Array.isArray(body.emoji) && body.emoji.length && items.length
         && items.every((it) => typeof it.file_id === 'string' && (it.kind === 'static' || it.kind === 'video'));
       if (!valid) return json(res, 200, { ok: false, error: 'bad_request', message: 'درخواست نامعتبر.' });
-      return json(res, 200, { ok: true, ...buildView(startBuild({ ...body, items, kind: items[0].kind })) });
+      const kinds = new Set(items.map((it) => it.kind));
+      return json(res, 200, { ok: true, ...buildView(startBuild({ ...body, items, kind: kinds.size > 1 ? 'mixed' : items[0].kind })) });
     }
 
     json(res, 404, { ok: false, error: 'not_found' });
