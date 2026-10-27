@@ -6,6 +6,7 @@ RUN apt-get update \
 
 WORKDIR /app
 COPY --chown=node:node package.json server.js ./
+COPY --chown=node:node lib ./lib
 
 USER node
 # Render متغیر PORT رو خودش تنظیم می‌کنه (پیش‌فرض ۱۰۰۰۰)
