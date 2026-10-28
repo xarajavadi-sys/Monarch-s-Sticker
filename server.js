@@ -19,6 +19,7 @@ import { Fail } from './lib/errors.js';
 import { run } from './lib/util.js';
 import { PROFILES, active, convert, convertDeduped, jobs, waiting } from './lib/convert.js';
 import { notify } from './lib/telegram.js';
+import { T, normLang } from './lib/texts.js';
 import { bg, bgActive, bgCounts, bgWaiting, enqueueBg, view } from './lib/background.js';
 import { fail, json, keyOk, readBody, readJson } from './lib/http.js';
 import { MAX_PER_PACK, buildKey, buildView, builds, startBuild } from './lib/builds.js';
@@ -34,17 +35,17 @@ async function onShutdown() {
   if (shuttingDown) return;
   shuttingDown = true;
   const running = [...builds.values()].filter((b) => b.state === 'running');
-  await Promise.allSettled(running.map((b) => notify(b.chatId,
-    `⚠️ سرویس ساخت پک ری‌استارت شد و ساخت «${b.title}» نصفه موند.\nدکمه‌ی زیر رو بزن تا از همون‌جا ادامه بدم (چیزی که ساخته شده از بین نمی‌ره).`,
-    { reply_markup: { inline_keyboard: [[{ text: '▶️ ادامه‌ی ساخت', callback_data: `build:resume:${b.name}` }]] } })));
+  await Promise.allSettled(running.map((b) => notify(b.chatId, T(b.lang, 'restarted', b.title),
+    { reply_markup: { inline_keyboard: [[{ text: T(b.lang, 'resume_btn'), callback_data: `build:resume:${b.name}` }]] } })));
   process.exit(0);
 }
 process.on('SIGTERM', onShutdown);
 process.on('SIGINT', onShutdown);
 
 const server = http.createServer(async (req, res) => {
+  let url = null;
   try {
-    const url = new URL(req.url, 'http://x');
+    url = new URL(req.url, 'http://x');
 
     if (req.method === 'GET' && url.pathname === '/') {
       const run = [...builds.values()].filter((b) => b.state === 'running');
@@ -68,18 +69,18 @@ const server = http.createServer(async (req, res) => {
       const max = PROFILES[kind].video ? LIMITS.videoInputBytes : LIMITS.staticInputBytes;
       const bytes = await readBody(req, max);
 
-      const result = await convertDeduped(bytes, kind);
+      const result = await convertDeduped(bytes, kind);   // خطاها با fail(res, code, status, lang) و زبان ?lang=
       return json(res, 200, result);
     }
 
     if (req.method === 'POST' && (url.pathname === '/enqueue' || url.pathname === '/status')) {
       if (!keyOk(req.headers['x-api-key'])) return json(res, 401, { ok: false, error: 'unauthorized', message: 'unauthorized' });
-      if (!BOT_TOKEN) return json(res, 200, { ok: false, error: 'no_token', message: 'BOT_TOKEN روی سرویس تنظیم نشده.' });
+      if (!BOT_TOKEN) return json(res, 200, { ok: false, error: 'no_token', message: T(normLang(url.searchParams.get('lang')), 'no_token') });
       const body = await readJson(req);
       const items = Array.isArray(body.items) ? body.items.slice(0, 200) : [];
       const valid = (it) => it && typeof it.file_id === 'string' && it.file_id.length < 300 && (it.kind === 'static' || it.kind === 'video');
       if (url.pathname === '/enqueue') {
-        const out = items.map((it) => (valid(it) ? view(enqueueBg(it.file_id, it.kind, Number(it.user_id))) : { state: 'failed', error: 'unsupported' }));
+        const out = items.map((it) => (valid(it) ? view(enqueueBg(it.file_id, it.kind, Number(it.user_id), it.lang)) : { state: 'failed', error: 'unsupported' }));
         return json(res, 200, { ok: true, items: out });
       }
       return json(res, 200, { ok: true, items: items.map((it) => (valid(it) ? view(bg.get(`${Number(it.user_id)}:${it.kind}:${it.file_id}`)) : { state: 'missing' })) });
@@ -87,7 +88,7 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === 'POST' && ['/build', '/build/status', '/build/cancel'].includes(url.pathname)) {
       if (!keyOk(req.headers['x-api-key'])) return json(res, 401, { ok: false, error: 'unauthorized', message: 'unauthorized' });
-      if (!BOT_TOKEN) return json(res, 200, { ok: false, error: 'no_token', message: 'BOT_TOKEN روی سرویس تنظیم نشده.' });
+      if (!BOT_TOKEN) return json(res, 200, { ok: false, error: 'no_token', message: T(normLang(url.searchParams.get('lang')), 'no_token') });
       const body = await readJson(req, 2_000_000);
       if (url.pathname === '/build/status') return json(res, 200, { ok: true, ...buildView(builds.get(buildKey(body.user_id, body.name))) });
       if (url.pathname === '/build/cancel') {
@@ -103,14 +104,14 @@ const server = http.createServer(async (req, res) => {
       const valid = Number.isInteger(Number(body.user_id)) && Number.isInteger(Number(body.chat_id)) && /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(String(body.name || ''))
         && body.title && Array.isArray(body.emoji) && body.emoji.length && items.length
         && items.every((it) => typeof it.file_id === 'string' && (it.kind === 'static' || it.kind === 'video'));
-      if (!valid) return json(res, 200, { ok: false, error: 'bad_request', message: 'درخواست نامعتبر.' });
+      if (!valid) return json(res, 200, { ok: false, error: 'bad_request', message: T(normLang(body.lang), 'bad_request') });
       const kinds = new Set(items.map((it) => it.kind));
       return json(res, 200, { ok: true, ...buildView(startBuild({ ...body, items, kind: kinds.size > 1 ? 'mixed' : items[0].kind })) });
     }
 
     json(res, 404, { ok: false, error: 'not_found' });
   } catch (e) {
-    if (e instanceof Fail) return fail(res, e.code, e.status);
+    if (e instanceof Fail) return fail(res, e.code, e.status, normLang(url?.searchParams?.get('lang')));
     console.error('unexpected', e);
     if (!res.headersSent) fail(res, 'failed', 500);
   }
