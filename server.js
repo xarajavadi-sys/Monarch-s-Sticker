@@ -1,7 +1,7 @@
 // سرویس تبدیل مدیا برای Monarch Stickerbot
 //   POST /convert?kind=static|video|thumb_static|thumb_video   (بدنه: بایت‌های خام فایل، هدر x-api-key)
-//   POST /split?start=&end=&seg=&cuts=&crop=&cx=&cy=&from=&max=   (ویدیوی بلند ← چند استیکر ویدیویی ۳ثانیه‌ای)
-//   POST /split/start  GET /split/status  GET /split/clip  POST /split/end   (همون برش، به‌صورت کار پس‌زمینه برای ربات)
+//   POST /split/start  GET /split/status  GET /split/clip  POST /split/end   (برش ویدیوی بلند به تکه‌های ≤۳ثانیه‌ای، کار پس‌زمینه برای ربات)
+//   POST /split?...   (همون برش، هم‌زمان؛ برای تست)
 //   GET  /health
 // بدون هیچ وابستگی npm؛ فقط Node 18+ و ffmpeg/ffprobe.
 //
@@ -19,7 +19,15 @@ import { timingSafeEqual, createHash, randomBytes } from 'node:crypto';
 const PORT = Number(process.env.PORT || 10000);   // Render خودش PORT رو می‌ده
 const API_KEY = process.env.MEDIA_KEY || '';
 const MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT || 2);
-const MAX_QUEUE = 20;
+const MAX_QUEUE = 60;
+
+// تنظیمات انکودر VP9 (با متغیر محیطی Render عوض می‌شه، بدون تغییر کد)
+//   VP9_DEADLINE = good | realtime        (پیش‌فرض good: کندتر ولی فشرده‌سازی بهتر)
+//   VP9_CPU_USED = 0..5 برای good، 0..8 برای realtime   (پیش‌فرض 3)
+//   MAX_FPS      = سقف فریم‌ریت خروجی ویدیو (پیش‌فرض 30 = سقف رسمی تلگرام)
+const VP9_DEADLINE = process.env.VP9_DEADLINE === 'realtime' ? 'realtime' : 'good';
+const VP9_CPU_USED = String(Number(process.env.VP9_CPU_USED ?? 3));
+const MAX_FPS = Math.min(60, Math.max(24, Number(process.env.MAX_FPS ?? 30)));
 
 const LIMITS = {
   staticInputBytes: 20 * 1024 * 1024,   // سقف دانلود تلگرام برای ربات
@@ -28,11 +36,12 @@ const LIMITS = {
   videoOutBytes: 254 * 1024,            // سقف تلگرام ۲۵۶KB؛ کمی کمتر برای اطمینان
   videoMaxInputSec: 4,                  // بیشتر از این رد می‌شه
   videoOutSec: 3,                       // سقف تلگرام برای استیکر ویدیویی
+  videoTargetSec: 2.95,                 // هدف کمی کمتر از ۳ ثانیه (حاشیه‌ی خطای گرد کردن)
   ffmpegTimeoutMs: 90_000,
   // برش ویدیوی بلند (/split)
   splitInputBytes: 20 * 1024 * 1024,    // سقف دانلود ربات از تلگرام
   splitMaxInputSec: 60 * 60,
-  splitMaxPerCall: 8,                   // حداکثر تعداد کلیپ در هر درخواست (CPU ضعیف Render؛ بقیه با from=next)
+  splitMaxPerCall: 8,                   // فقط برای /split هم‌زمان
   splitMinClipSec: 0.5,                 // تکه‌ی کوتاه‌تر از این دور ریخته می‌شه
 };
 
@@ -40,12 +49,12 @@ const LIMITS = {
 const STATIC_QUALITIES = [92, 85, 75, 65, 55, 45, 35, 25, 15];
 // br = ضریبی از «بودجه‌ی بیت‌ریت» که از سقف حجم محاسبه می‌شه (کنترل حجم در همون پاس اول)
 const VIDEO_STEPS = [
-  { crf: 30, fps: 30, br: 1.0 },
-  { crf: 36, fps: 30, br: 0.8 },
-  { crf: 42, fps: 24, br: 0.6 },
-  { crf: 48, fps: 20, br: 0.45 },
-  { crf: 52, fps: 15, br: 0.35 },
-  { crf: 58, fps: 12, br: 0.25 },
+  { fps: 30, br: 1.0 },
+  { fps: 30, br: 0.85 },
+  { fps: 30, br: 0.7 },
+  { fps: 24, br: 0.55 },            // فریم‌ریت از ۲۴ پایین‌تر نمی‌ره (پرش نداشته باشه)
+  { fps: 24, br: 0.42 },
+  { fps: 24, br: 0.3 },
 ];
 
 // فرمت‌های ورودی مجاز (ffprobe format_name). جلوی خوندن playlist/concat و ... رو می‌گیره.
@@ -66,6 +75,7 @@ const E = {
   busy:        'سرور الان شلوغه، چند لحظه‌ی دیگه دوباره بفرست.',
   bad_range:   'بازه‌ی زمانی نامعتبره (شروع/پایان/مدت هر تکه رو چک کن).',
   no_clips:    'توی این بازه تکه‌ای برای برش پیدا نشد.',
+  split_too_long: 'ویدیو خیلی طولانیه (حداکثر یک ساعت).',
 };
 
 // ───────── ابزارها ─────────
@@ -117,6 +127,8 @@ function inspect(info) {
     duration,
     fps: parseRate(v.avg_frame_rate) || parseRate(v.r_frame_rate) || 30,
     isWebm: names.includes('webm') || names.includes('matroska'),
+    // آلفای واقعی: webm با alpha_mode، پیکسل‌فرمت آلفادار، یا گیف/apng (شفافیت دارن)
+    alpha: v.tags?.alpha_mode === '1' || /yuva|rgba|bgra|argb|abgr|gbrap|ya8|ya16|pal8/.test(String(v.pix_fmt || '')) || v.codec_name === 'gif' || v.codec_name === 'apng',
   };
 }
 
@@ -166,46 +178,57 @@ async function makeStatic(input, dir, m, p) {
 //  ۳ تا ۳.۱ ثانیه     : فقط ته ویدیو بریده می‌شه
 //  ۳.۱ تا ۴ ثانیه     : سریع‌تر پخش می‌شه تا دقیقاً ۳ ثانیه بشه
 //  > ۴ ثانیه          : رد می‌شه
-//  seg (اختیاری، برای /split): { start, dur, crop } ← فقط همین تکه از ویدیو برش می‌خوره
-//    (دقیق: -ss بعد از -i)، و crop (فیلتر ffmpeg) قبل از scale اعمال می‌شه
-async function makeVideo(input, dir, m, p, seg = null) {
+//  opts.seg (برای /split): { index, start, dur, crop } ← فقط همین تکه از ویدیو برش می‌خوره
+//    (-ss بعد از -i = دقیق) و فیلتر crop قبل از scale اعمال می‌شه
+async function makeVideo(input, dir, m, p, opts = {}) {
+  const seg = opts.seg ?? null;
   const d = seg ? seg.dur : m.duration;
   if (!seg && d > LIMITS.videoMaxInputSec + 0.05) throw new Fail('too_long');
 
-  const needsTrim = d > LIMITS.videoOutSec;
-  const speedUp = !seg && d > 3.1;               // ۳.۱ تا ۴
-  const pixFmt = p.pad || m.isWebm || m.codec === 'gif' ? 'yuva420p' : 'yuv420p';
+  const target = LIMITS.videoTargetSec;               // ۲٫۹۵ ثانیه
+  const needsTrim = d > target && d <= 3.1;           // ۲٫۹۵ تا ۳٫۱: فقط ته ویدیو بریده می‌شه
+  const speedUp = d > 3.1;                            // ۳٫۱ تا ۴: سریع‌تر پخش می‌شه (هیچ فریمی دور ریخته نمی‌شه)
+  const alpha = p.pad || m.alpha;
+  const pixFmt = alpha ? 'yuva420p' : 'yuv420p';
   const out = join(dir, seg ? `out_${seg.index}.webm` : 'out.webm');
 
-  const outSec = Math.min(d, LIMITS.videoOutSec) || 1;
-  // ۹۰٪ سقف حجم (جا برای container و نوسان VBR) تقسیم بر مدت = بیت‌ریت هدف
-  const budgetBps = Math.floor((p.outBytes * 8 * 0.9) / outSec);
+  const outSec = Math.min(d, target) || 1;
+  // ۹۳٪ سقف حجم (جا برای container و نوسان) تقسیم بر مدت = بیت‌ریت هدف
+  const budgetBps = Math.floor((p.outBytes * 8 * 0.93) / outSec);
+
+  // فریم‌ریت واقعی بعد از تند کردن (مثلاً ۱۰۴ فریم توی ۲٫۹۵ ثانیه ≈ ۳۵٫۲)
+  const effFps = (m.fps || 30) * (speedUp ? d / target : 1);
+  const fpsCap = Math.min(opts.fpsCap ?? MAX_FPS, 60);
+  let usedFps = effFps;
 
   for (const step of VIDEO_STEPS) {
     const bps = Math.max(40_000, Math.floor(budgetBps * step.br));
     const filters = [];
     if (seg?.crop) filters.push(seg.crop);
-    if (speedUp) filters.push(`setpts=PTS*${(LIMITS.videoOutSec / d).toFixed(6)}`);
-    const fps = Math.min(m.fps, step.fps, 30);
-    if (fps < m.fps - 0.01) filters.push(`fps=${fps}`);
+    if (speedUp) filters.push(`setpts=PTS*${(target / d).toFixed(6)}`);
+    const cap = Math.min(fpsCap, step.fps === 30 ? fpsCap : step.fps);
+    usedFps = Math.min(effFps, cap);
+    if (effFps > cap + 0.01) filters.push(`fps=${cap}`);           // فقط وقتی از سقف بیشتر باشه
     filters.push(scaleFilter(p), `format=${pixFmt}`);
 
     const args = [
       '-nostdin', '-y', '-v', 'error', '-protocol_whitelist', 'file',
       ...decoderArgs(m), '-i', input,
-      ...(seg ? ['-ss', String(seg.start), '-t', String(seg.dur)] : []),
+      ...(seg ? ['-ss', String(seg.start)] : []),
       '-map', '0:v:0', '-an', '-sn', '-dn',
       '-vf', filters.join(','),
-      ...(!seg && needsTrim ? ['-t', String(LIMITS.videoOutSec)] : []),
-      '-c:v', 'libvpx-vp9', '-b:v', String(bps), '-maxrate', String(bps), '-crf', String(step.crf),
-      '-pix_fmt', pixFmt, '-auto-alt-ref', '0',
-      '-row-mt', '1', '-deadline', 'good', '-cpu-used', '5', '-threads', '2',
+      '-fps_mode', 'passthrough',                                  // زمان‌بندی فریم‌ها دست‌نخورده؛ هیچ فریمی حذف/تکرار نمی‌شه
+      ...(seg ? ['-t', String(Math.min(seg.dur, target))] : (needsTrim || speedUp ? ['-t', String(target)] : [])),
+      '-c:v', 'libvpx-vp9', '-b:v', String(bps), '-maxrate', String(bps),   // بدون -crf: کیفیت با بیت‌ریت تعیین می‌شه
+      '-pix_fmt', pixFmt,
+      ...(alpha ? ['-auto-alt-ref', '0'] : []),                    // فقط برای شفافیت لازمه؛ بدون آلفا فشرده‌سازی بهتره
+      '-row-mt', '1', '-deadline', VP9_DEADLINE, '-cpu-used', VP9_CPU_USED, '-threads', '2',
       '-f', 'webm', out,
     ];
     const r = await run('ffmpeg', args);
     if (r.code !== 0) throw new Fail('failed');
     const size = (await stat(out)).size;
-    if (size <= p.outBytes) return { file: out, mime: 'video/webm' };
+    if (size <= p.outBytes) return { file: out, mime: 'video/webm', fps: Number(usedFps.toFixed(2)) };
   }
   throw new Fail('too_big_out');
 }
@@ -226,7 +249,7 @@ async function outputInfo(file) {
 }
 
 // ───────── پردازش یک درخواست ─────────
-async function convert(bytes, kind) {
+async function convert(bytes, kind, opts = {}) {
   const p = PROFILES[kind];
   if (bytes.length < 16) throw new Fail('unsupported');
   if (bytes[0] === 0x1f && bytes[1] === 0x8b) throw new Fail('tgs'); // gzip = tgs
@@ -240,7 +263,7 @@ async function convert(bytes, kind) {
     await writeFile(input, bytes);
     const m = inspect(await probe(input));
 
-    const res = p.video ? await makeVideo(input, dir, m, p) : await makeStatic(input, dir, m, p);
+    const res = p.video ? await makeVideo(input, dir, m, p, opts) : await makeStatic(input, dir, m, p);
 
     const buf = await readFile(res.file);
     const info = await outputInfo(res.file);
@@ -251,6 +274,7 @@ async function convert(bytes, kind) {
       width: info.width ?? null,
       height: info.height ?? null,
       duration: p.video ? Number((info.duration ?? 0).toFixed(2)) : 0,
+      fps: res.fps ?? null,
       size: buf.length,
       data: buf.toString('base64'),
     };
@@ -330,7 +354,7 @@ async function prepareSplit(bytes, o) {
     const input = join(dir, 'in.bin');
     await writeFile(input, bytes);
     const m = inspect(await probe(input));
-    if (!m.duration || m.duration > LIMITS.splitMaxInputSec) throw new Fail('too_long');
+    if (!m.duration || m.duration > LIMITS.splitMaxInputSec) throw new Fail('split_too_long');
     const crop = squareCrop(o);
     const plan = planClips(m.duration, o);
     return { dir, input, m, crop, plan };
@@ -342,7 +366,7 @@ async function prepareSplit(bytes, o) {
 
 async function renderClip(ctx, idx) {
   const c = ctx.plan[idx];
-  const res = await makeVideo(ctx.input, ctx.dir, ctx.m, PROFILES.video, { index: idx, start: c.start, dur: c.dur, crop: ctx.crop });
+  const res = await makeVideo(ctx.input, ctx.dir, ctx.m, PROFILES.video, { seg: { index: idx, start: c.start, dur: c.dur, crop: ctx.crop } });
   const info = await outputInfo(res.file);
   return { file: res.file, start: c.start, end: Number((c.start + c.dur).toFixed(3)), width: info.width ?? null, height: info.height ?? null, duration: Number((info.duration ?? 0).toFixed(2)) };
 }
@@ -377,7 +401,7 @@ async function splitVideo(bytes, o) {
 //  حافظه: کار بعد از ۳۰ دقیقه بی‌استفاده پاک می‌شه. حداکثر MAX_JOBS کار هم‌زمان.
 const JOBS = new Map();
 const MAX_JOBS = 3;
-const JOB_TTL_MS = 30 * 60 * 1000;
+const SPLIT_TTL_MS = 30 * 60 * 1000;
 
 function dropJob(id) {
   const j = JOBS.get(id);
@@ -386,7 +410,7 @@ function dropJob(id) {
   j.cancelled = true;
   rm(j.ctx.dir, { recursive: true, force: true }).catch(() => {});
 }
-setInterval(() => { for (const [id, j] of JOBS) if (Date.now() - j.touched > JOB_TTL_MS) dropJob(id); }, 60_000).unref();
+setInterval(() => { for (const [id, j] of JOBS) if (Date.now() - j.touched > SPLIT_TTL_MS) dropJob(id); }, 60_000).unref();
 
 async function startSplitJob(bytes, o) {
   if (JOBS.size >= MAX_JOBS) throw new Fail('busy', 503);
@@ -398,7 +422,7 @@ async function startSplitJob(bytes, o) {
   (async () => {
     for (let i = 0; i < ctx.plan.length && !job.cancelled; i++) {
       try {
-        job.results[i] = await schedule(() => renderClip(ctx, i));
+        job.results[i] = await schedule(() => renderClip(ctx, i), { unbounded: true });
       } catch (e) {
         job.results[i] = null;
         job.failed.push({ index: i, error: e instanceof Fail ? e.code : 'failed', message: E[e instanceof Fail ? e.code : 'failed'] ?? E.failed });
@@ -431,9 +455,9 @@ async function jobClip(id, i) {
 // ───────── صف ساده (حداکثر MAX_CONCURRENT کار هم‌زمان) ─────────
 let active = 0;
 const waiting = [];
-async function schedule(fn) {
+async function schedule(fn, { unbounded = false } = {}) {
   if (active >= MAX_CONCURRENT) {
-    if (waiting.length >= MAX_QUEUE) throw new Fail('busy', 503);
+    if (!unbounded && waiting.length >= MAX_QUEUE) throw new Fail('busy', 503);
     await new Promise((res) => waiting.push(res));
   }
   active++;
@@ -444,6 +468,442 @@ async function schedule(fn) {
     if (next) next();
   }
 }
+
+// ───────── کش و هم‌پوشانی کارها ─────────
+// ربات سرورلس مهلت کوتاهی داره و ممکنه وسط انتظار قطع بشه؛ بعداً همون فایل رو دوباره می‌فرسته.
+// پس نتیجه‌ی هر فایل (بر اساس هش محتوا) چند دقیقه نگه داشته می‌شه و درخواست تکراری به همون کار وصل می‌شه.
+const JOB_TTL_MS = 30 * 60_000;
+const JOB_MAX = 150;
+const jobs = new Map();   // key → { promise, result, at }
+async function convertDeduped(bytes, kind, opts = {}) {
+  const key = createHash('sha256').update(`${kind}#${opts.fpsCap ?? ''}`).update(bytes).digest('hex');
+  const now = Date.now();
+  for (const [k, j] of jobs) if (j.result && now - j.at > JOB_TTL_MS) jobs.delete(k);
+  while (jobs.size >= JOB_MAX) {                       // قدیمی‌ترین نتیجه‌ی تمام‌شده حذف می‌شه
+    const oldest = [...jobs].find(([, j]) => j.result);
+    if (!oldest) break;
+    jobs.delete(oldest[0]);
+  }
+  let job = jobs.get(key);
+  if (job) return job.promise;
+  job = { at: now, result: null, promise: null };
+  job.promise = schedule(() => convert(bytes, kind, opts), { unbounded: opts.unbounded }).then(
+    (r) => { job.result = r; job.at = Date.now(); return r; },
+    (e) => { jobs.delete(key); throw e; },     // busy و خطاهای گذرا کش نمی‌شن
+  );
+  jobs.set(key, job);
+  return job.promise;
+}
+
+
+// ───────── کارهای پس‌زمینه: دانلود از تلگرام ← تبدیل ← آپلود به‌عنوان فایل استیکر ─────────
+// ربات سرورلس فقط «ثبت» می‌کنه (enqueue) و بعداً وضعیت می‌پرسه (status)؛ هیچ‌وقت منتظر تبدیل نمی‌مونه.
+// نیازمند BOT_TOKEN (توکن ربات از BotFather) در متغیرهای محیطی رندر.
+const BOT_TOKEN = process.env.BOT_TOKEN || '';
+const TG_API = (process.env.TG_API || 'https://api.telegram.org').replace(/\/+$/, '');
+const BG_TTL_MS = 6 * 60 * 60_000;
+const BG_MAX = 3000;
+const bg = new Map();   // "kind:file_id" → { state, userId, stickerFileId?, error?, message?, at }
+
+class TgErr extends Error {
+  constructor(msg, permanent) { super(msg); this.permanent = permanent; }
+}
+
+async function tgCall(method, body) {
+  let r;
+  try {
+    r = await fetch(`${TG_API}/bot${BOT_TOKEN}/${method}`, { ...(body ? { method: 'POST', body } : {}), signal: AbortSignal.timeout(body ? 60_000 : 20_000) });
+  } catch (e) { throw new TgErr(`network: ${e.message}`, false); }
+  let j = null;
+  try { j = await r.json(); } catch (_) { /* غیر JSON */ }
+  if (!j?.ok) {
+    const permanent = r.status >= 400 && r.status < 500 && r.status !== 429;
+    throw new TgErr(j?.description || `HTTP ${r.status}`, permanent);
+  }
+  return j.result;
+}
+
+async function tgDownload(fileId, maxBytes) {
+  const info = await tgCall(`getFile?file_id=${encodeURIComponent(fileId)}`);
+  if (info.file_size && info.file_size > maxBytes) throw new Fail('too_large');
+  let r;
+  try { r = await fetch(`${TG_API}/file/bot${BOT_TOKEN}/${info.file_path}`, { signal: AbortSignal.timeout(45_000) }); }
+  catch (e) { throw new TgErr(`network: ${e.message}`, false); }
+  if (!r.ok) throw new TgErr(`download HTTP ${r.status}`, r.status < 500);
+  let buf;
+  try { buf = Buffer.from(await r.arrayBuffer()); } catch (e) { throw new TgErr(`network: ${e.message}`, false); }
+  if (buf.length > maxBytes) throw new Fail('too_large');
+  return buf;
+}
+
+async function tgUploadSticker(userId, kind, bytes, mime) {
+  const form = new FormData();
+  form.set('user_id', String(userId));
+  form.set('sticker_format', kind === 'video' ? 'video' : 'static');
+  form.set('sticker', new Blob([bytes], { type: mime }), kind === 'video' ? 'sticker.webm' : 'sticker.webp');
+  return tgCall('uploadStickerFile', form);
+}
+
+async function runBgJob(key, job, fileId, kind) {
+  try {
+    const p = PROFILES[kind];
+    const max = p.video ? LIMITS.videoInputBytes : LIMITS.staticInputBytes;
+    const bytes = await tgDownload(fileId, max);
+    let out = await convertDeduped(bytes, kind, { unbounded: true });
+    if (!out.ok) { job.state = 'failed'; job.error = out.error; job.message = out.message; return; }
+    let up;
+    try {
+      up = await tgUploadSticker(job.userId, kind, Buffer.from(out.data, 'base64'), out.mime);
+    } catch (e) {
+      // فریم‌ریت بالای ۳۰ رد شد؟ یک بار با سقف رسمی ۳۰ دوباره می‌سازیم
+      if (!(e instanceof TgErr && e.permanent && kind === 'video' && out.fps > 30.01)) throw e;
+      console.warn('upload rejected at', out.fps, 'fps → retry at 30:', e.message);
+      out = await convertDeduped(bytes, kind, { unbounded: true, fpsCap: 30 });
+      if (!out.ok) { job.state = 'failed'; job.error = out.error; job.message = out.message; return; }
+      up = await tgUploadSticker(job.userId, kind, Buffer.from(out.data, 'base64'), out.mime);
+    }
+    job.stickerFileId = up.file_id;
+    job.state = 'done';
+  } catch (e) {
+    if (e instanceof Fail) { job.state = 'failed'; job.error = e.code; job.message = E[e.code] || E.failed; }
+    else if (e instanceof TgErr && e.permanent) { job.state = 'failed'; job.error = 'tg_rejected'; job.message = /too big/i.test(e.message) ? 'حجم فایل بیشتر از ۲۰ مگابایته (سقف دانلود تلگرام).' : `تلگرام این فایل رو قبول نکرد: ${e.message}`; }
+    else { job.state = 'retry'; job.error = 'transient'; console.warn('bg job transient', key, e?.message); }
+  } finally {
+    job.at = Date.now();
+  }
+}
+
+// حداکثر چند کار پس‌زمینه هم‌زمان (هرکدوم ممکنه تا ۵ مگابایت توی حافظه نگه داره)؛ خود تبدیل جداگانه با schedule محدود می‌شه
+const BG_CONCURRENT = 4;
+let bgActive = 0;
+const bgWaiting = [];          // { userId, resolve }
+let bgLastUser = null;
+// نوبت منصفانه: کاربری که ۱۲۰ فایل فرستاده نذاره بقیه معطل بمونن (به‌ترتیب بین کاربرها می‌چرخه)
+function bgPickNext() {
+  if (!bgWaiting.length) return null;
+  let i = bgWaiting.findIndex((w) => w.userId !== bgLastUser);
+  if (i < 0) i = 0;
+  const [w] = bgWaiting.splice(i, 1);
+  bgLastUser = w.userId;
+  return w;
+}
+async function bgSchedule(userId, fn) {
+  if (bgActive >= BG_CONCURRENT) await new Promise((resolve) => bgWaiting.push({ userId, resolve }));
+  bgActive++;
+  try { return await fn(); }
+  finally { bgActive--; bgPickNext()?.resolve(); }
+}
+
+function enqueueBg(fileId, kind, userId) {
+  const key = `${userId}:${kind}:${fileId}`;          // کلید شامل کاربره: فایل آپلودشده فقط برای صاحبش معتبره
+  const now = Date.now();
+  for (const [k, j] of bg) if (j.state !== 'queued' && j.state !== 'running' && now - j.at > BG_TTL_MS) bg.delete(k);
+  if (bg.size >= BG_MAX) for (const [k, j] of bg) { if (j.state === 'done' || j.state === 'failed') { bg.delete(k); if (bg.size < BG_MAX * 0.9) break; } }
+  let job = bg.get(key);
+  if (job && job.state === 'running' && now - (job.startedAt ?? now) > 4 * 60_000) job = null;   // گیرکرده؛ از نو
+  if (job && (job.state === 'queued' || job.state === 'running' || job.state === 'done' || job.state === 'failed')) {
+    return job;
+  }
+  job = { state: 'queued', userId, at: now };
+  bg.set(key, job);
+  bgSchedule(userId, async () => { job.state = 'running'; job.startedAt = Date.now(); await runBgJob(key, job, fileId, kind); })
+    .catch((e) => { job.state = 'retry'; job.error = String(e?.message || e); });
+  return job;
+}
+
+function bgCounts() {
+  const c = { queued: 0, running: 0, done: 0, failed: 0, retry: 0 };
+  for (const j of bg.values()) c[j.state] = (c[j.state] ?? 0) + 1;
+  return c;
+}
+
+const view = (j) => (j
+  ? { state: j.state, ...(j.state === 'done' ? { sticker_file_id: j.stickerFileId } : {}), ...(j.state === 'failed' || j.state === 'retry' ? { error: j.error, message: j.message } : {}) }
+  : { state: 'missing' });
+
+async function readJson(req, max = 1_000_000) {
+  const chunks = []; let n = 0;
+  for await (const c of req) { n += c.length; if (n > max) throw new Fail('too_large', 413); chunks.push(c); }
+  try { return JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch (_) { throw new Fail('unsupported', 400); }
+}
+
+
+// ───────── ساخت کامل پک سمت سرویس ─────────
+// ربات فقط درخواست ساخت می‌فرسته؛ سرویس فایل‌ها رو آماده می‌کنه، پک رو می‌سازه و لینک رو مستقیم برای کاربر می‌فرسته
+// (کاربر لازم نیست منتظر بمونه). وضعیت توی حافظه‌ست؛ ربات بعداً با /build/status می‌پرسه و حسابداری رو انجام می‌ده.
+const builds = new Map();          // "userId:name" → وضعیت ساخت
+const BUILD_TTL_MS = 6 * 60 * 60_000;
+const FIRST_STATIC = 20;           // تعداد اولیه‌ی createNewStickerSet
+const FIRST_VIDEO = 5;
+const MAX_PER_PACK = 120;
+
+async function tgJson(method, obj) {
+  let r;
+  try {
+    r = await fetch(`${TG_API}/bot${BOT_TOKEN}/${method}`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(obj),
+      signal: AbortSignal.timeout(60_000),
+    });
+  } catch (e) { throw new TgErr(`network: ${e.message}`, false); }
+  let j = null;
+  try { j = await r.json(); } catch (_) { /* غیر JSON */ }
+  if (!j?.ok) {
+    const err = new TgErr(j?.description || `HTTP ${r.status}`, r.status >= 400 && r.status < 500 && r.status !== 429);
+    err.code = j?.error_code ?? r.status;
+    err.retryAfter = j?.parameters?.retry_after;
+    throw err;
+  }
+  return j.result;
+}
+
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// فراخوانی تلگرام با تلاش مجدد برای ۴۲۹ و خطاهای شبکه
+async function tgRetry(method, obj, tries = 5) {
+  for (let i = 0; ; i++) {
+    try { return await tgJson(method, obj); }
+    catch (e) {
+      const wait = e.code === 429 ? Math.min(Number(e.retryAfter ?? 5), 60) * 1000 + 300 : (!e.permanent ? 2000 * (i + 1) : 0);
+      if (!(e instanceof TgErr) || !wait || i >= tries - 1) throw e;
+      await sleepMs(wait);
+    }
+  }
+}
+
+const notify = (chatId, text, extra = {}) => tgJson('sendMessage', { chat_id: chatId, text, ...extra }).catch((e) => console.warn('notify failed', e?.message));
+
+function buildKey(userId, name) { return `${Number(userId)}:${String(name).toLowerCase()}`; }
+
+// ───── نوار پیشرفت (یک پیام که سرویس خودش ویرایشش می‌کنه) ─────
+const PREP_WEIGHT = 0.85;                       // سهم آماده‌سازی فایل‌ها از کل کار؛ بقیه افزودن به پک
+const faNum = (n) => String(n).replace(/\d/g, (d) => '۰۱۲۳۴۵۶۷۸۹'[d]);
+
+function buildPercent(b) {
+  const n = Math.max(1, b.items.length);
+  const prep = Math.min(1, (b.ready + (b.failedCount ?? 0)) / n);
+  const add = b.phase === 'adding' || b.phase === 'done' ? Math.min(1, b.added / Math.max(1, b.addTotal || n)) : 0;
+  if (b.phase === 'done') return 100;
+  return Math.min(99, Math.round((PREP_WEIGHT * prep + (1 - PREP_WEIGHT) * add) * 100));
+}
+
+function buildEta(b) {
+  const p = buildPercent(b) / 100;
+  const el = (Date.now() - b.startedAt) / 1000;
+  if (p < 0.05 || el < 15) return null;
+  return Math.round(el * (1 - p) / p);
+}
+
+const etaText = (sec) => {
+  if (sec == null) return 'در حال محاسبه…';
+  if (sec < 45) return 'کمتر از یک دقیقه';
+  const m = Math.round(sec / 60);
+  return m >= 60 ? `حدود ${faNum(Math.round(m / 6) / 10)} ساعت` : `حدود ${faNum(m)} دقیقه`;
+};
+
+const bar = (pct, cells = 12) => {
+  const full = Math.round((pct / 100) * cells);
+  return '▰'.repeat(full) + '▱'.repeat(cells - full);
+};
+
+function progressMessage(b) {
+  const pct = b.state === 'done' ? 100 : buildPercent(b);
+  const phase = b.phase === 'adding' ? `افزودن استیکرها: ${faNum(b.added)} از ${faNum(b.addTotal || b.items.length)}`
+    : b.phase === 'creating' ? 'ساخت پک روی تلگرام'
+    : `آماده‌سازی فایل‌ها: ${faNum(b.ready)} از ${faNum(b.items.length)}`;
+  return `⏳ در حال ساخت «${b.title}»\n\n${bar(pct)}  ${faNum(pct)}٪\n${phase}\n⏱ زمان باقی‌مونده: ${etaText(buildEta(b))}\n\nلازم نیست منتظر بمونی؛ لینک پک خودکار می‌آد.`;
+}
+
+async function touchProgress(b, force = false) {
+  const now = Date.now();
+  if (!force && now - (b.progAt ?? 0) < 3500) return;
+  const text = progressMessage(b);
+  if (text === b.progText) return;
+  b.progAt = now;
+  if (!b.progId) {
+    b.progText = text;
+    const m = await tgJson('sendMessage', { chat_id: b.chatId, text }).catch((e) => { console.warn('progress send failed', e?.message); return null; });
+    b.progId = m?.message_id ?? null;
+    return;
+  }
+  b.progText = text;
+  await tgJson('editMessageText', { chat_id: b.chatId, message_id: b.progId, text })
+    .catch((e) => { if (!/not modified/i.test(e?.message ?? '')) console.warn('progress edit failed', e?.message); });
+}
+
+async function endProgress(b, text) {
+  if (b.progId) {
+    const ok = await tgJson('editMessageText', { chat_id: b.chatId, message_id: b.progId, text }).then(() => true).catch(() => false);
+    if (ok) return;
+  }
+  await notify(b.chatId, text);
+}
+
+const ITEM_KIND = (it) => (it.kind === 'video' ? 'video' : 'static');
+
+async function runBuild(b) {
+  try {
+    // ادامه‌ی ساختی که قبلاً کامل شده (سرویس خوابیده بود و حافظه‌ش پاک شده): بدون تبدیل دوباره، همین‌جا تموم
+    if (b.resume) {
+      const set = await tgJson('getStickerSet', { name: b.name }).catch(() => null);
+      if (set && set.stickers.length >= Math.min(b.items.length, MAX_PER_PACK)) {
+        b.stickerCount = set.stickers.length;
+        b.videoCount = set.stickers.filter((x) => x.is_video).length;
+        b.staticCount = b.stickerCount - b.videoCount;
+        b.phase = 'done'; b.state = 'done'; b.noop = true; b.at = Date.now();
+        return;
+      }
+    }
+    // ۱) ثبت همه‌ی فایل‌ها برای تبدیل (فایل‌هایی که قبلاً ثبت شدن دوباره کار نمی‌شن)
+    b.phase = 'preparing';
+    await touchProgress(b, true);
+    const keyOf = (it) => `${b.userId}:${ITEM_KIND(it)}:${it.file_id}`;
+    for (const it of b.items) enqueueBg(it.file_id, ITEM_KIND(it), b.userId);
+    const retries = new Map();
+    while (true) {
+      if (b.cancelled) throw new BuildFail('cancelled', 'ساخت لغو شد.');
+      let pending = 0; let ready = 0; let failedN = 0;
+      for (const it of b.items) {
+        const j = bg.get(keyOf(it));
+        if (j?.state === 'done') ready++;
+        else if (j?.state === 'failed') failedN++;
+        else if (j?.state === 'retry' || !j) {
+          const n = (retries.get(keyOf(it)) ?? 0) + 1; retries.set(keyOf(it), n);
+          if (n <= 4) { enqueueBg(it.file_id, ITEM_KIND(it), b.userId); pending++; } else failedN++;
+        } else pending++;
+      }
+      b.ready = ready; b.failedCount = failedN;
+      await touchProgress(b);
+      if (!pending) break;
+      await sleepMs(2000);
+    }
+
+    const okItems = []; const bad = [];
+    for (const it of b.items) {
+      const j = bg.get(keyOf(it));
+      if (j?.state === 'done') okItems.push({ ...it, kind: ITEM_KIND(it), sticker: j.stickerFileId });
+      else bad.push({ message_id: it.message_id, message: j?.message || 'تبدیل ناموفق بود.' });
+    }
+    b.failedItems = bad;
+    if (!okItems.length) throw new BuildFail('all_failed', 'هیچ‌کدوم از فایل‌ها آماده نشد.');
+    b.addTotal = okItems.length;
+
+    // ۲) ساخت پک (دسته‌ی کوچک)، یا ادامه‌ی پک نیمه‌کاره
+    b.phase = 'creating';
+    await touchProgress(b, true);
+    const input = (it) => ({ sticker: it.sticker, format: it.kind, emoji_list: (Array.isArray(it.emoji) && it.emoji.length ? it.emoji : b.emoji) });
+    let next = 0;
+    const firstN = okItems.slice(0, FIRST_STATIC).some((it) => it.kind === 'video') ? FIRST_VIDEO : FIRST_STATIC;
+    let existed = false;
+    try {
+      await tgRetry('createNewStickerSet', { user_id: b.userId, name: b.name, title: b.title, stickers: okItems.slice(0, firstN).map(input) });
+      next = Math.min(firstN, okItems.length);
+    } catch (e) {
+      if (e instanceof TgErr && /occupied|already/i.test(e.message)) {
+        if (!b.resume) throw new BuildFail('name_taken', 'این نام همین الان گرفته شد.');
+        const set = await tgRetry('getStickerSet', { name: b.name });     // ادامه‌ی پک نیمه‌کاره
+        next = Math.max(1, Math.min(set.stickers.length, okItems.length));
+        existed = true;
+      } else throw e;
+    }
+    const startNext = next;
+
+    // ۳) اضافه کردن بقیه
+    b.phase = 'adding';
+    b.added = next;
+    await touchProgress(b, true);
+    for (; next < okItems.length && next < MAX_PER_PACK; next++) {
+      if (b.cancelled) throw new BuildFail('cancelled', 'ساخت لغو شد.');
+      try {
+        await tgRetry('addStickerToSet', { user_id: b.userId, name: b.name, sticker: input(okItems[next]) });
+        b.added++;
+      } catch (e) {
+        if (e instanceof TgErr && /STICKERS_TOO_MUCH|too many/i.test(e.message)) break;
+        if (e instanceof TgErr && e.permanent) { bad.push({ message_id: okItems[next].message_id, message: `تلگرام قبولش نکرد: ${e.message}` }); continue; }
+        throw e;
+      }
+      await touchProgress(b);
+      await sleepMs(250);
+    }
+
+    // ۴) نتیجه
+    const set = await tgRetry('getStickerSet', { name: b.name });
+    b.stickerCount = set.stickers.length;
+    b.videoCount = set.stickers.filter((s) => s.is_video).length;
+    b.staticCount = b.stickerCount - b.videoCount;
+    b.phase = 'done'; b.state = 'done'; b.at = Date.now();
+    b.noop = Boolean(b.resume && existed && (startNext >= okItems.length || b.added === startNext));     // قبلاً کامل شده بود؛ دوباره پیام نمی‌دیم
+
+    if (!b.noop) {
+      const link = `https://t.me/addstickers/${b.name}`;
+      await endProgress(b, `✅ ساخت «${b.title}» تموم شد (۱۰۰٪)`);
+      await notify(b.chatId, `🎉 پک «${b.title}» ساخته شد!\n\n${link}`, {
+        reply_markup: { inline_keyboard: [[{ text: '📦 مشاهده و افزودن پک', url: link }]] },
+      });
+      for (const f of bad.slice(0, 10)) {
+        if (!f.message_id) continue;
+        await tgJson('setMessageReaction', { chat_id: b.chatId, message_id: f.message_id, reaction: [{ type: 'emoji', emoji: '👎' }] }).catch(() => {});
+        await notify(b.chatId, `❌ این فایل توی پک نیومد: ${f.message}`, { reply_parameters: { message_id: f.message_id, allow_sending_without_reply: true } });
+      }
+      if (bad.length > 10) await notify(b.chatId, `و ${bad.length - 10} فایل دیگه هم اضافه نشد.`);
+    } else if (b.progId) {
+      await tgJson('deleteMessage', { chat_id: b.chatId, message_id: b.progId }).catch(() => {});
+    }
+  } catch (e) {
+    b.state = 'failed'; b.phase = 'failed'; b.at = Date.now();
+    b.error = e instanceof BuildFail ? e.code : 'error';
+    console.warn('build failed', b.userId, b.name, e?.message);
+    if (b.error === 'cancelled') { await endProgress(b, `🛑 ساخت «${b.title}» لغو شد.`); return; }
+    const why = e instanceof BuildFail ? e.message : `خطای تلگرام: ${e?.message ?? ''}`;
+    await endProgress(b, `❌ ساخت پک «${b.title}» ناموفق بود: ${why}\n\nاعتبارت برگردونده می‌شه. دوباره از ربات «ساخت پک جدید» رو بزن.`);
+  }
+}
+
+class BuildFail extends Error {
+  constructor(code, message) { super(message); this.code = code; }
+}
+
+function startBuild(req) {
+  const key = buildKey(req.user_id, req.name);
+  for (const [k, b] of builds) if (b.state !== 'running' && Date.now() - (b.at ?? 0) > BUILD_TTL_MS) builds.delete(k);
+  const old = builds.get(key);
+  if (old && (old.state === 'running' || (old.state === 'done' && req.resume))) return old;   // تکراری؛ همون کار قبلی
+  if (old && old.state === 'done') builds.delete(key);                                        // پک جدید با همین نام (قبلی تموم شده)
+  const b = {
+    state: 'running', phase: 'queued', userId: Number(req.user_id), chatId: Number(req.chat_id), name: String(req.name),
+    title: String(req.title), emoji: req.emoji, kind: ['video', 'mixed'].includes(req.kind) ? req.kind : 'static', resume: Boolean(req.resume),
+    items: req.items, ready: 0, added: 0, addTotal: 0, failedItems: [], failedCount: 0, at: Date.now(), startedAt: Date.now(), cancelled: false,
+  };
+  builds.set(key, b);
+  runBuild(b).catch((e) => console.error('runBuild crashed', e));
+  return b;
+}
+
+const buildView = (b) => (b
+  ? { state: b.state, phase: b.phase, ready: b.ready, total: b.items.length, added: b.added, failed: b.failedItems.length, error: b.error,
+      percent: b.state === 'done' ? 100 : buildPercent(b), eta: b.state === 'running' ? buildEta(b) : null, noop: Boolean(b.noop),
+      ...(b.state === 'done' ? { stickerCount: b.stickerCount, staticCount: b.staticCount, videoCount: b.videoCount } : {}) }
+  : { state: 'missing' });
+
+// ───────── نگه داشتن سرویس بیدار تا کار تموم بشه + پیام قبل از ری‌استارت ─────────
+const SELF_URL = (process.env.SELF_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/+$/, '');
+const anyBusy = () => [...JOBS.values()].some((j) => j.state === 'running') || active > 0 || waiting.length > 0 || bgActive > 0 || bgWaiting.length > 0 || [...builds.values()].some((b) => b.state === 'running');
+if (SELF_URL) {
+  // Render رایگان بعد از ۱۵ دقیقه بدون درخواست ورودی می‌خوابه؛ تا وقتی کار داریم خودمون رو صدا می‌زنیم
+  setInterval(() => { if (anyBusy()) fetch(`${SELF_URL}/health`).catch(() => {}); }, 8 * 60_000).unref();
+}
+
+let shuttingDown = false;
+async function onShutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  const running = [...builds.values()].filter((b) => b.state === 'running');
+  await Promise.allSettled(running.map((b) => notify(b.chatId,
+    `⚠️ سرویس ساخت پک ری‌استارت شد و ساخت «${b.title}» نصفه موند.\nدکمه‌ی زیر رو بزن تا از همون‌جا ادامه بدم (چیزی که ساخته شده از بین نمی‌ره).`,
+    { reply_markup: { inline_keyboard: [[{ text: '▶️ ادامه‌ی ساخت', callback_data: `build:resume:${b.name}` }]] } })));
+  process.exit(0);
+}
+process.on('SIGTERM', onShutdown);
+process.on('SIGINT', onShutdown);
 
 // ───────── HTTP ─────────
 const sha = (s) => createHash('sha256').update(s).digest();
@@ -486,8 +946,18 @@ const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, 'http://x');
 
-    if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/health')) {
-      return json(res, 200, { ok: true, service: 'monarch-media', active, queued: waiting.length });
+    if (req.method === 'GET' && url.pathname === '/') {
+      const run = [...builds.values()].filter((b) => b.state === 'running');
+      const body = `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Monarch Media</title>` +
+        `<body style="font-family:system-ui;max-width:32rem;margin:2rem auto;padding:0 1rem;line-height:1.7">` +
+        `<h2>🟢 Monarch Media</h2><p>ساخت‌های در جریان: <b>${run.length}</b><br>تبدیل فعال: <b>${active}</b> · صف: <b>${waiting.length}</b><br>` +
+        `کارهای پس‌زمینه: <b>${bgActive}</b> فعال · <b>${bgWaiting.length}</b> در صف<br>BOT_TOKEN: <b>${BOT_TOKEN ? 'تنظیم شده' : 'تنظیم نشده ⚠️'}</b></p>` +
+        `<p style="color:#888;font-size:.85rem">این صفحه فقط خلاصه‌ی وضعیت رو نشون می‌ده؛ جزئیات هر ساخت داخل ربات (پروفایل من) دیده می‌شه.</p></body>`;
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      return res.end(body);
+    }
+    if (req.method === 'GET' && url.pathname === '/health') {
+      return json(res, 200, { ok: true, service: 'monarch-media', active, queued: waiting.length, cached: jobs.size, tg: Boolean(BOT_TOKEN), bg: bgCounts(), builds: [...builds.values()].filter((b) => b.state === 'running').length, vp9: `${VP9_DEADLINE}/${VP9_CPU_USED}`, maxFps: MAX_FPS });
     }
 
     if (req.method === 'POST' && url.pathname === '/convert') {
@@ -498,8 +968,42 @@ const server = http.createServer(async (req, res) => {
       const max = PROFILES[kind].video ? LIMITS.videoInputBytes : LIMITS.staticInputBytes;
       const bytes = await readBody(req, max);
 
-      const result = await schedule(() => convert(bytes, kind));
+      const result = await convertDeduped(bytes, kind);
       return json(res, 200, result);
+    }
+
+    if (req.method === 'POST' && (url.pathname === '/enqueue' || url.pathname === '/status')) {
+      if (!keyOk(req.headers['x-api-key'])) return json(res, 401, { ok: false, error: 'unauthorized', message: 'unauthorized' });
+      if (!BOT_TOKEN) return json(res, 200, { ok: false, error: 'no_token', message: 'BOT_TOKEN روی سرویس تنظیم نشده.' });
+      const body = await readJson(req);
+      const items = Array.isArray(body.items) ? body.items.slice(0, 200) : [];
+      const valid = (it) => it && typeof it.file_id === 'string' && it.file_id.length < 300 && (it.kind === 'static' || it.kind === 'video');
+      if (url.pathname === '/enqueue') {
+        const out = items.map((it) => (valid(it) ? view(enqueueBg(it.file_id, it.kind, Number(it.user_id))) : { state: 'failed', error: 'unsupported' }));
+        return json(res, 200, { ok: true, items: out });
+      }
+      return json(res, 200, { ok: true, items: items.map((it) => (valid(it) ? view(bg.get(`${Number(it.user_id)}:${it.kind}:${it.file_id}`)) : { state: 'missing' })) });
+    }
+
+    if (req.method === 'POST' && ['/build', '/build/status', '/build/cancel'].includes(url.pathname)) {
+      if (!keyOk(req.headers['x-api-key'])) return json(res, 401, { ok: false, error: 'unauthorized', message: 'unauthorized' });
+      if (!BOT_TOKEN) return json(res, 200, { ok: false, error: 'no_token', message: 'BOT_TOKEN روی سرویس تنظیم نشده.' });
+      const body = await readJson(req, 2_000_000);
+      if (url.pathname === '/build/status') return json(res, 200, { ok: true, ...buildView(builds.get(buildKey(body.user_id, body.name))) });
+      if (url.pathname === '/build/cancel') {
+        const b = builds.get(buildKey(body.user_id, body.name));
+        if (b && b.state === 'running') b.cancelled = true;
+        return json(res, 200, { ok: true, cancelled: Boolean(b && b.state === 'running') });
+      }
+      const items = (Array.isArray(body.items) ? body.items.slice(0, MAX_PER_PACK) : []).map((it) => ({
+        ...it, emoji: Array.isArray(it.emoji) ? it.emoji.filter((e) => typeof e === 'string').slice(0, 20) : undefined,
+      }));
+      const valid = Number.isInteger(Number(body.user_id)) && Number.isInteger(Number(body.chat_id)) && /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(String(body.name || ''))
+        && body.title && Array.isArray(body.emoji) && body.emoji.length && items.length
+        && items.every((it) => typeof it.file_id === 'string' && (it.kind === 'static' || it.kind === 'video'));
+      if (!valid) return json(res, 200, { ok: false, error: 'bad_request', message: 'درخواست نامعتبر.' });
+      const kinds = new Set(items.map((it) => it.kind));
+      return json(res, 200, { ok: true, ...buildView(startBuild({ ...body, items, kind: kinds.size > 1 ? 'mixed' : items[0].kind })) });
     }
 
     if (url.pathname.startsWith('/split')) {
